@@ -41,12 +41,19 @@ class MLMCollate:
                 seq = torch.tensor(seq, dtype=torch.long)
             input_ids_list.append(seq)
             
-        # 1. 组装图像 (若图像分辨率动态变化，此处可能需要进行特殊的 padding 处理，这里假设已被预处理统一尺寸或可通过 stack)
+        # 1. 组装图像并进行 2D Padding (支持动态分辨率)
         if len(images) > 0 and isinstance(images[0], torch.Tensor):
-            try:
-                images = torch.stack(images, dim=0)
-            except RuntimeError:
-                pass # 如果尺寸不同，后续需要在 Vision Encoder 支持动态尺寸，或在此增加 pad 逻辑
+            max_h = max(img.shape[1] for img in images)
+            max_w = max(img.shape[2] for img in images)
+            batch_size = len(images)
+
+            batched_images = torch.zeros((batch_size, 1, max_h, max_w), dtype=torch.float32)
+
+            for i, img in enumerate(images):
+                _, h, w = img.shape
+                batched_images[i, :, :h, :w] = img
+
+            images = batched_images
                 
         # 2. 组装 Token 序列并填充 Padding
         input_ids = pad_sequence(input_ids_list, batch_first=True, padding_value=self.pad_token_id)

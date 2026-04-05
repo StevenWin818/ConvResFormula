@@ -70,7 +70,7 @@ class LatexOCRModel(nn.Module):
         前向传播 (支持双分支模式)
         Args:
             images: [Batch, 1, H, W] 图像张量
-            tgt_seq: [Batch, SeqLen] 输入给 Decoder 的文本 ID (通常去掉了最后一位)
+            tgt_seq: [Batch, SeqLen] 输入给 Decoder 的文本 ID 
             is_causal: True 为标准 AR 模式(下三角掩码)，False 为 MLM 模式(无掩码，允许双向互看)
         Returns:
             logits: [Batch, SeqLen, vocab_size]
