@@ -1,1 +1,13 @@
-# ConvNeXt-V2 + AttnRes Transformer 模型配置
+model:
+  d_model: 512
+
+vision_encoder:
+  model_name: convnextv2_pico
+  pretrained: true
+  in_chans: 1
+
+text_decoder:
+  nhead: 8
+  num_layers: 4
+  dim_feedforward: 2048
+  dropout: 0.1

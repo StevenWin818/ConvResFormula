@@ -1,1 +1,45 @@
-# MLM 训练配置
+data:
+  train_h5:
+    - C:/Projects/LatexProject/ConvResFormula/datasets/train.h5
+    - C:/Projects/LatexProject/ConvResFormula/datasets/synthetic.h5
+    - C:/Projects/LatexProject/ConvResFormula/datasets/symbols.h5
+  eval_h5: C:/Projects/LatexProject/ConvResFormula/datasets/val.h5
+  tokenizer: C:/Projects/LatexProject/ConvResFormula/tokenizer_bpe.json
+  max_area: 98304
+
+training:
+  batch_size: 24  
+  num_workers: 4  
+  epochs: 20
+  seed: 42
+
+optimization:
+  encoder_lr: 5.0e-5
+  decoder_lr: 1.0e-4
+  weight_decay: 1.0e-2
+
+scheduler:
+  warmup_epochs: 1.0
+  warmup_start_lr: 1.0e-7
+  eta_min: 1.0e-6
+
+mlm:
+  mask_prob: 0.15
+
+logging:
+  log_interval: 20
+
+eval:
+  eval_interval: 1
+  batch_size: 32
+  num_workers: 2
+  samples: 1500
+  max_len: 160
+  max_iter: 4
+  skip_eval: false
+
+runtime:
+  ckpt_dir: checkpoints/mlm
+  log_dir: logs/mlm_logs
+  resume_ckpt: checkpoints/mlm/latest.pth
+  resume: false
