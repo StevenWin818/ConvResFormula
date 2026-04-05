@@ -30,13 +30,15 @@ class PositionalEncoding2D(nn.Module):
         
         div_term = torch.exp(torch.arange(0, d_model_half, 2).float() * -(math.log(10000.0) / d_model_half))
         
-        # Y轴 (前一半通道)
-        pe[0:d_model_half:2, :, :] = torch.sin(y_position * div_term).unsqueeze(2).repeat(1, 1, max_w)
-        pe[1:d_model_half:2, :, :] = torch.cos(y_position * div_term).unsqueeze(2).repeat(1, 1, max_w)
-        
-        # X轴 (后一半通道)
-        pe[d_model_half::2, :, :] = torch.sin(x_position * div_term).unsqueeze(1).repeat(1, max_h, 1)
-        pe[d_model_half+1::2, :, :] = torch.cos(x_position * div_term).unsqueeze(1).repeat(1, max_h, 1)
+        # Y轴 (前一半通道): [H, K] -> [K, H, W]
+        y_embed = y_position * div_term
+        pe[0:d_model_half:2, :, :] = torch.sin(y_embed).transpose(0, 1).unsqueeze(2).repeat(1, 1, max_w)
+        pe[1:d_model_half:2, :, :] = torch.cos(y_embed).transpose(0, 1).unsqueeze(2).repeat(1, 1, max_w)
+
+        # X轴 (后一半通道): [W, K] -> [K, H, W]
+        x_embed = x_position * div_term
+        pe[d_model_half::2, :, :] = torch.sin(x_embed).transpose(0, 1).unsqueeze(1).repeat(1, max_h, 1)
+        pe[d_model_half+1::2, :, :] = torch.cos(x_embed).transpose(0, 1).unsqueeze(1).repeat(1, max_h, 1)
         
         # 注册为 buffer，这样它就不会成为模型可训练参数，但会随模型保存和移动(GPU/CPU)
         self.register_buffer('pe', pe)

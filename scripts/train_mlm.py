@@ -84,6 +84,7 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--eval_samples", type=int, default=None, help=h("eval_samples", "每轮评估抽样数量，<=0 表示全量"))
 	parser.add_argument("--eval_max_len", type=int, default=None, help=h("eval_max_len", "评估解码最大长度"))
 	parser.add_argument("--eval_max_iter", type=int, default=None, help=h("eval_max_iter", "评估迭代解码步数"))
+	parser.add_argument("--amp_dtype", type=str, choices=["fp16", "bf16", "fp32"], default=None, help=h("amp_dtype", "训练精度类型: fp16 / bf16 / fp32"))
 
 	eval_group = parser.add_mutually_exclusive_group()
 	eval_group.add_argument("--skip_eval", dest="skip_eval", action="store_true", help=h("skip_eval", "仅训练不做评估"))
@@ -163,6 +164,10 @@ def apply_config_defaults(args: argparse.Namespace, train_cfg: Dict[str, Any], m
 
 	if args.skip_eval is None:
 		args.skip_eval = bool(_cfg_get(train_cfg, ("eval", "skip_eval"), False))
+
+	args.amp_dtype = str(args.amp_dtype or _cfg_get(train_cfg, ("runtime", "amp_dtype"), "fp16")).lower()
+	if args.amp_dtype not in {"fp16", "bf16", "fp32"}:
+		raise ValueError(f"amp_dtype 必须是 fp16/bf16/fp32，当前为: {args.amp_dtype}")
 
 	args.ckpt_dir = args.ckpt_dir or str(_cfg_get(train_cfg, ("runtime", "ckpt_dir"), r"checkpoints\mlm"))
 	args.log_dir = args.log_dir or str(_cfg_get(train_cfg, ("runtime", "log_dir"), r"logs\mlm_logs"))
@@ -375,6 +380,7 @@ def batched_infer_mlm_iterative(
 	max_len: int,
 	max_iter: int,
 	amp_enabled: bool,
+	amp_dtype: torch.dtype,
 ) -> List[List[int]]:
 	"""批量版 Mask-Predict 解码，用于加速训练期评估。"""
 	batch_size = images.size(0)
@@ -385,9 +391,13 @@ def batched_infer_mlm_iterative(
 	if max_len > 1:
 		token_ids[:, 1:] = mask_id
 
+	# 视觉特征在一次迭代解码中不变，仅提取一次并复用
+	with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+		memory = model.encode(images)
+
 	for step in range(max_iter):
-		with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled):
-			logits = model(images=images, tgt_seq=token_ids, is_causal=False)
+		with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+			logits = model.decode(memory=memory, tgt_seq=token_ids, is_causal=False)
 
 		probs = torch.softmax(logits, dim=-1)
 		max_probs, preds = torch.max(probs, dim=-1)
@@ -423,6 +433,8 @@ def evaluate_epoch(
 	eval_loader: DataLoader,
 	tokenizer: Tokenizer,
 	device: torch.device,
+	amp_enabled: bool,
+	amp_dtype: torch.dtype,
 	pad_id: int,
 	mask_id: int,
 	bos_id: int,
@@ -433,7 +445,6 @@ def evaluate_epoch(
 ) -> Tuple[float, Counter[str], Dict[str, float]]:
 	"""参考 train_2d_phase2 的评估流程：按 epoch 抽样评估 + Top 错误统计。"""
 	model.eval()
-	amp_enabled = device.type == "cuda"
 
 	processed = 0
 	exact = 0
@@ -458,6 +469,7 @@ def evaluate_epoch(
 			max_len=max_len,
 			max_iter=max_iter,
 			amp_enabled=amp_enabled,
+			amp_dtype=amp_dtype,
 		)
 
 		for i in range(len(pred_batch)):
@@ -505,7 +517,17 @@ def main() -> None:
 	log_path = os.path.join(args.log_dir, "train_mlm.log")
 
 	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-	amp_enabled = device.type == "cuda"
+	amp_dtype_map: Dict[str, torch.dtype] = {
+		"fp16": torch.float16,
+		"bf16": torch.bfloat16,
+		"fp32": torch.float32,
+	}
+	amp_dtype = amp_dtype_map[args.amp_dtype]
+	amp_enabled = (device.type == "cuda") and (args.amp_dtype != "fp32")
+	if device.type != "cuda" and args.amp_dtype != "fp32":
+		print("警告: 当前为 CPU 设备，已自动降级为 fp32 训练。")
+		amp_dtype = torch.float32
+		amp_enabled = False
 
 	tokenizer = Tokenizer.from_file(args.tokenizer)
 	vocab_size = tokenizer.get_vocab_size()
@@ -608,13 +630,15 @@ def main() -> None:
 		eta_min=args.eta_min,
 	)
 
-	scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+	scaler = torch.cuda.amp.GradScaler(enabled=True) if (device.type == "cuda" and args.amp_dtype == "fp16") else None
 	trainer = MLMTrainer(
 		model=model,
 		optimizer=optimizer,
 		scheduler=scheduler,
 		device=device,
-		scaler=scaler if amp_enabled else None,
+		scaler=scaler,
+		amp_enabled=amp_enabled,
+		amp_dtype=amp_dtype,
 	)
 
 	start_epoch = 1
@@ -626,7 +650,7 @@ def main() -> None:
 		model.load_state_dict(checkpoint["model"], strict=True)
 		optimizer.load_state_dict(checkpoint["optimizer"])
 		scheduler.load_state_dict(checkpoint["scheduler"])
-		if amp_enabled and checkpoint.get("scaler") is not None:
+		if scaler is not None and checkpoint.get("scaler") is not None:
 			scaler.load_state_dict(checkpoint["scaler"])
 
 		start_epoch = int(checkpoint.get("epoch", 0)) + 1
@@ -639,7 +663,7 @@ def main() -> None:
 			f.write("Timestamp\tEpoch\tLoss\tMaskAcc(%)\tEvalProcessed\tEvalExact\tEvalEM(%)\tEvalNED\tLREnc\tLRDec\n")
 
 	print("=" * 80)
-	print(f"MLM 训练启动 | Device={device} | AMP={amp_enabled}")
+	print(f"MLM 训练启动 | Device={device} | AMP={amp_enabled} | AMP_DTYPE={args.amp_dtype}")
 	print(f"TrainConfig={args.train_config}")
 	print(f"ModelConfig={args.model_config}")
 	print(f"Datasets={dataset_paths}")
@@ -665,6 +689,8 @@ def main() -> None:
 				eval_loader=eval_loader,
 				tokenizer=tokenizer,
 				device=device,
+				amp_enabled=amp_enabled,
+				amp_dtype=amp_dtype,
 				pad_id=pad_id,
 				mask_id=mask_id,
 				bos_id=bos_id,
@@ -708,7 +734,7 @@ def main() -> None:
 			"eval_ned": float(eval_ned),
 			"config": vars(args),
 		}
-		if amp_enabled:
+		if scaler is not None:
 			ckpt_payload["scaler"] = scaler.state_dict()
 
 		latest_ckpt = os.path.join(args.ckpt_dir, "latest.pth")

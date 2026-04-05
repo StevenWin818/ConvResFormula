@@ -7,20 +7,24 @@ import torch.nn as nn
 from tqdm import tqdm
 
 class MLMTrainer:
-    def __init__(self, model, optimizer, scheduler, device, scaler=None):
+    def __init__(self, model, optimizer, scheduler, device, scaler=None, amp_enabled=False, amp_dtype=torch.float16):
         """
         Args:
             model: LatexOCRModel 实例
             optimizer: 优化器
             scheduler: 学习率调度器
             device: 训练设备 (cuda/cpu)
-            scaler: torch.cuda.amp.GradScaler 实例 (用于混合精度训练)
+            scaler: torch.amp.GradScaler 实例 (仅 fp16 需要)
+            amp_enabled: 是否启用 autocast
+            amp_dtype: autocast 使用的精度类型
         """
         self.model = model
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.device = device
         self.scaler = scaler
+        self.amp_enabled = bool(amp_enabled)
+        self.amp_dtype = amp_dtype
         
         # ignore_index=-100 自动忽略不需要预测的 Token
         self.criterion = nn.CrossEntropyLoss(ignore_index=-100)
@@ -52,7 +56,7 @@ class MLMTrainer:
             self.optimizer.zero_grad()
             
             # 2. 混合精度前向传播
-            with torch.cuda.amp.autocast(enabled=self.scaler is not None):
+            with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.amp_enabled):
                 # 注意：MLM 模式下，is_causal 必须为 False
                 logits = self.model(images=images, tgt_seq=masked_token_ids, is_causal=False)
                 

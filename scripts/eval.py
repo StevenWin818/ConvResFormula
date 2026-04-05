@@ -106,9 +106,13 @@ def batched_infer_mlm_iterative(
 	if max_len > 1:
 		token_ids[:, 1:] = mask_id
 
+	# 视觉特征在一次迭代解码中保持不变，仅提取一次并复用
+	with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled):
+		memory = model.encode(images)
+
 	for step in range(max_iter):
 		with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled):
-			logits = model(images=images, tgt_seq=token_ids, is_causal=False)
+			logits = model.decode(memory=memory, tgt_seq=token_ids, is_causal=False)
 
 		probs = torch.softmax(logits, dim=-1)
 		max_probs, preds = torch.max(probs, dim=-1)

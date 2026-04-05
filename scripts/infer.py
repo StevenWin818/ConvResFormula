@@ -19,9 +19,11 @@ def infer_mlm_iterative(model, image, tokenizer, max_len=256, max_iter=5, device
     token_ids[0, 1:] = mask_id 
     
     with torch.no_grad():
+        # 视觉特征在迭代中不变，提前缓存避免重复执行 ConvNeXt-V2
+        memory = model.encode(image)
         for step in range(max_iter):
-            # 前向传播，is_causal 必须为 False 以启用双向注意力
-            logits = model(images=image, tgt_seq=token_ids, is_causal=False)
+            # 仅做解码迭代，is_causal=False 以启用双向注意力
+            logits = model.decode(memory=memory, tgt_seq=token_ids, is_causal=False)
             
             probs = F.softmax(logits, dim=-1)
             max_probs, preds = torch.max(probs, dim=-1)

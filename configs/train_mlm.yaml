@@ -46,6 +46,7 @@ runtime:
   log_dir: logs/mlm_logs # 日志输出目录
   resume_ckpt: checkpoints/mlm/latest.pth # 恢复训练使用的 checkpoint
   resume: false # 是否默认启用断点恢复
+  amp_dtype: fp16 # 训练精度类型(fp16/bf16/fp32)
 
 cli_help:
   description: ConvNeXt-V2 + AttnRes 的 MLM 训练脚本
@@ -77,6 +78,7 @@ cli_help:
   eval_samples: 每轮评估抽样数量，<=0 表示全量
   eval_max_len: 评估解码最大长度
   eval_max_iter: 评估迭代解码步数
+  amp_dtype: 训练精度类型(fp16/bf16/fp32)
   skip_eval: 仅训练不做评估
   enable_eval: 启用训练期评估
   ckpt_dir: checkpoint 输出目录
