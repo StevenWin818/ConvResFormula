@@ -1,45 +1,86 @@
 data:
   train_h5:
-    - C:/Projects/LatexProject/ConvResFormula/datasets/train.h5
-    - C:/Projects/LatexProject/ConvResFormula/datasets/synthetic.h5
-    - C:/Projects/LatexProject/ConvResFormula/datasets/symbols.h5
-  eval_h5: C:/Projects/LatexProject/ConvResFormula/datasets/val.h5
-  tokenizer: C:/Projects/LatexProject/ConvResFormula/tokenizer_bpe.json
-  max_area: 98304
+    - C:/Projects/LatexProject/ConvResFormula/datasets/train.h5 # 手写训练集
+    - C:/Projects/LatexProject/ConvResFormula/datasets/synthetic.h5 # 合成训练集
+    - C:/Projects/LatexProject/ConvResFormula/datasets/symbols.h5 # 单字符训练集
+  eval_h5: C:/Projects/LatexProject/ConvResFormula/datasets/val.h5 # 验证/评估集
+  tokenizer: C:/Projects/LatexProject/ConvResFormula/tokenizer_bpe.json # BPE 分词器
+  max_area: 98304 # 图像动态缩放的面积上限
 
 training:
-  batch_size: 24  
-  num_workers: 4  
-  epochs: 20
-  seed: 42
+  batch_size: 24 # 训练 batch 大小
+  num_workers: 4 # 训练 DataLoader 线程数
+  epochs: 20 # 总训练轮数
+  seed: 42 # 随机种子
+  mix_ratio: [1, 1, 1] # 多数据源采样比例，手写:合成:单字符
+  epoch_samples: 0 # 每个 epoch 的采样总数，<=0 表示全量
+  bucket_mega_factor: 30 # 分桶 mega-batch 系数
 
 optimization:
-  encoder_lr: 5.0e-5
-  decoder_lr: 1.0e-4
-  weight_decay: 1.0e-2
+  encoder_lr: 5.0e-5 # 编码器学习率
+  decoder_lr: 1.0e-4 # 解码器学习率
+  weight_decay: 1.0e-2 # AdamW 权重衰减
 
 scheduler:
-  warmup_epochs: 1.0
-  warmup_start_lr: 1.0e-7
-  eta_min: 1.0e-6
+  warmup_epochs: 1.0 # 线性预热轮数
+  warmup_start_lr: 1.0e-7 # warmup 起始学习率
+  eta_min: 1.0e-6 # 余弦退火最小学习率
 
 mlm:
-  mask_prob: 0.15
+  mask_prob: 0.15 # MLM 掩码比例
 
 logging:
-  log_interval: 20
+  log_interval: 20 # 训练日志打印间隔(step)
 
 eval:
-  eval_interval: 1
-  batch_size: 32
-  num_workers: 2
-  samples: 1500
-  max_len: 160
-  max_iter: 4
-  skip_eval: false
+  eval_interval: 1 # 每隔多少个 epoch 评估一次
+  batch_size: 32 # 评估 batch 大小
+  num_workers: 2 # 评估 DataLoader 线程数
+  samples: 1500 # 每轮评估抽样数量，<=0 表示全量
+  max_len: 160 # 评估解码最大长度
+  max_iter: 4 # 评估迭代解码步数
+  skip_eval: false # 是否跳过训练期评估
 
 runtime:
-  ckpt_dir: checkpoints/mlm
-  log_dir: logs/mlm_logs
-  resume_ckpt: checkpoints/mlm/latest.pth
-  resume: false
+  ckpt_dir: checkpoints/mlm # checkpoint 输出目录
+  log_dir: logs/mlm_logs # 日志输出目录
+  resume_ckpt: checkpoints/mlm/latest.pth # 恢复训练使用的 checkpoint
+  resume: false # 是否默认启用断点恢复
+
+cli_help:
+  description: ConvNeXt-V2 + AttnRes 的 MLM 训练脚本
+  train_config: 训练配置文件路径
+  model_config: 模型配置文件路径
+  train_h5: 训练集 H5 列表，可传多个文件
+  tokenizer: BPE Tokenizer JSON 路径
+  eval_h5: 评估集 H5 路径
+  max_area: 图像动态缩放最大面积
+  d_model: 模型隐藏维度
+  batch_size: 训练批大小
+  num_workers: 训练 DataLoader 线程数
+  epochs: 训练轮数
+  seed: 随机种子
+  mix_ratio: 多数据源采样比例，例如 1 1 5
+  epoch_samples: 每个 epoch 总采样数，<=0 使用全量
+  bucket_mega_factor: 分桶 mega-batch 系数
+  encoder_lr: 视觉编码器学习率
+  decoder_lr: 解码器学习率
+  weight_decay: 权重衰减系数
+  warmup_epochs: 学习率 warmup 轮数
+  warmup_start_lr: warmup 起始学习率
+  eta_min: 余弦退火最小学习率
+  mask_prob: MLM 掩码比例
+  log_interval: 训练日志打印间隔(step)
+  eval_interval: 每隔多少个 epoch 评估一次
+  eval_batch_size: 评估批大小
+  eval_num_workers: 评估 DataLoader 线程数
+  eval_samples: 每轮评估抽样数量，<=0 表示全量
+  eval_max_len: 评估解码最大长度
+  eval_max_iter: 评估迭代解码步数
+  skip_eval: 仅训练不做评估
+  enable_eval: 启用训练期评估
+  ckpt_dir: checkpoint 输出目录
+  log_dir: 日志输出目录
+  resume_ckpt: 恢复训练的 checkpoint 路径
+  resume: 从 resume_ckpt 恢复完整训练状态
+  fresh_start: 不恢复断点，冷启动训练

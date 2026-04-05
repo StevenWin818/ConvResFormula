@@ -46,6 +46,14 @@ class MLMFormulaDataset(Dataset):
         with h5py.File(self.h5_path, 'r') as f:
             labels_ds: Any = f['labels']
             self.length = int(labels_ds.shape[0])
+            if 'widths' in f and 'heights' in f:
+                widths = np.asarray(f['widths'][:], dtype=np.float32)
+                heights = np.asarray(f['heights'][:], dtype=np.float32)
+                heights = np.maximum(heights, 1.0)
+                self.aspect_ratios = widths / heights
+            else:
+                # 回退：缺少宽高元数据时使用常数，避免分桶流程崩溃
+                self.aspect_ratios = np.ones((self.length,), dtype=np.float32)
             
         # 工作进程专用的 h5 句柄 (避免多进程 Dataloader 发生死锁)
         self.h5_file = None

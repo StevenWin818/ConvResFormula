@@ -8,14 +8,14 @@ from collections import Counter
 from datetime import datetime
 from functools import partial
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
 import torch
 import torch.optim as optim
 from tokenizers import Tokenizer
 from torch.nn.utils.rnn import pad_sequence
-from torch.utils.data import ConcatDataset, DataLoader
+from torch.utils.data import ConcatDataset, DataLoader, Sampler
 from tqdm import tqdm
 
 try:
@@ -35,51 +35,68 @@ from src.models.latex_ocr_model import LatexOCRModel
 
 
 def parse_args() -> argparse.Namespace:
-	parser = argparse.ArgumentParser(description="ConvNeXt-V2 + AttnRes 的 MLM 训练脚本")
+	bootstrap = argparse.ArgumentParser(add_help=False)
+	bootstrap.add_argument("--train-config", type=str, default=str(PROJECT_ROOT / "configs/train_mlm.yaml"))
+	bootstrap_args, _ = bootstrap.parse_known_args()
 
-	parser.add_argument("--train-config", type=str, default=str(PROJECT_ROOT / "configs/train_mlm.yaml"))
-	parser.add_argument("--model-config", type=str, default=str(PROJECT_ROOT / "configs/model_convnext_attnres.yaml"))
+	help_cfg: Dict[str, str] = {}
+	if os.path.exists(bootstrap_args.train_config):
+		cfg = load_yaml_config(bootstrap_args.train_config)
+		raw_help = _cfg_get(cfg, ("cli_help",), {})
+		if isinstance(raw_help, dict):
+			help_cfg = {str(k): str(v) for k, v in raw_help.items()}
 
-	parser.add_argument("--train_h5", type=str, nargs="+", default=None, help="训练集 H5 列表，可传多个文件。")
-	parser.add_argument("--tokenizer", type=str, default=None, help="BPE Tokenizer JSON 路径。")
-	parser.add_argument("--eval_h5", type=str, default=None, help="评估集 H5 路径。")
-	parser.add_argument("--max_area", type=int, default=None, help="图像动态缩放最大面积。")
+	def h(key: str, fallback: str) -> str:
+		return help_cfg.get(key, fallback)
 
-	parser.add_argument("--d_model", type=int, default=None)
-	parser.add_argument("--batch_size", type=int, default=None)
-	parser.add_argument("--num_workers", type=int, default=None)
-	parser.add_argument("--epochs", type=int, default=None)
-	parser.add_argument("--seed", type=int, default=None)
+	parser = argparse.ArgumentParser(description=h("description", "ConvNeXt-V2 + AttnRes 的 MLM 训练脚本"))
 
-	parser.add_argument("--encoder_lr", type=float, default=None)
-	parser.add_argument("--decoder_lr", type=float, default=None)
-	parser.add_argument("--weight_decay", type=float, default=None)
+	parser.add_argument("--train-config", type=str, default=str(PROJECT_ROOT / "configs/train_mlm.yaml"), help=h("train_config", "训练配置文件路径"))
+	parser.add_argument("--model-config", type=str, default=str(PROJECT_ROOT / "configs/model_convnext_attnres.yaml"), help=h("model_config", "模型配置文件路径"))
 
-	parser.add_argument("--warmup_epochs", type=float, default=None)
-	parser.add_argument("--warmup_start_lr", type=float, default=None)
-	parser.add_argument("--eta_min", type=float, default=None)
+	parser.add_argument("--train_h5", type=str, nargs="+", default=None, help=h("train_h5", "训练集 H5 列表，可传多个文件"))
+	parser.add_argument("--tokenizer", type=str, default=None, help=h("tokenizer", "BPE Tokenizer JSON 路径"))
+	parser.add_argument("--eval_h5", type=str, default=None, help=h("eval_h5", "评估集 H5 路径"))
+	parser.add_argument("--max_area", type=int, default=None, help=h("max_area", "图像动态缩放最大面积"))
 
-	parser.add_argument("--mask_prob", type=float, default=None)
-	parser.add_argument("--log_interval", type=int, default=None)
-	parser.add_argument("--eval_interval", type=int, default=None, help="每隔多少个 epoch 评估一次。")
-	parser.add_argument("--eval_batch_size", type=int, default=None)
-	parser.add_argument("--eval_num_workers", type=int, default=None)
-	parser.add_argument("--eval_samples", type=int, default=None, help="每轮评估抽样数量，<=0 表示全量")
-	parser.add_argument("--eval_max_len", type=int, default=None)
-	parser.add_argument("--eval_max_iter", type=int, default=None)
+	parser.add_argument("--d_model", type=int, default=None, help=h("d_model", "模型隐藏维度"))
+	parser.add_argument("--batch_size", type=int, default=None, help=h("batch_size", "训练批大小"))
+	parser.add_argument("--num_workers", type=int, default=None, help=h("num_workers", "训练 DataLoader 线程数"))
+	parser.add_argument("--epochs", type=int, default=None, help=h("epochs", "训练轮数"))
+	parser.add_argument("--seed", type=int, default=None, help=h("seed", "随机种子"))
+	parser.add_argument("--mix_ratio", type=int, nargs="+", default=None, help=h("mix_ratio", "多数据源采样比例，例如 1 1 5"))
+	parser.add_argument("--epoch_samples", type=int, default=None, help=h("epoch_samples", "每个 epoch 总采样数，<=0 使用全量"))
+	parser.add_argument("--bucket_mega_factor", type=int, default=None, help=h("bucket_mega_factor", "分桶 mega-batch 系数"))
+
+	parser.add_argument("--encoder_lr", type=float, default=None, help=h("encoder_lr", "视觉编码器学习率"))
+	parser.add_argument("--decoder_lr", type=float, default=None, help=h("decoder_lr", "解码器学习率"))
+	parser.add_argument("--weight_decay", type=float, default=None, help=h("weight_decay", "权重衰减系数"))
+
+	parser.add_argument("--warmup_epochs", type=float, default=None, help=h("warmup_epochs", "学习率 warmup 轮数"))
+	parser.add_argument("--warmup_start_lr", type=float, default=None, help=h("warmup_start_lr", "warmup 起始学习率"))
+	parser.add_argument("--eta_min", type=float, default=None, help=h("eta_min", "余弦退火最小学习率"))
+
+	parser.add_argument("--mask_prob", type=float, default=None, help=h("mask_prob", "MLM 掩码比例"))
+	parser.add_argument("--log_interval", type=int, default=None, help=h("log_interval", "训练日志打印间隔(step)"))
+	parser.add_argument("--eval_interval", type=int, default=None, help=h("eval_interval", "每隔多少个 epoch 评估一次"))
+	parser.add_argument("--eval_batch_size", type=int, default=None, help=h("eval_batch_size", "评估批大小"))
+	parser.add_argument("--eval_num_workers", type=int, default=None, help=h("eval_num_workers", "评估 DataLoader 线程数"))
+	parser.add_argument("--eval_samples", type=int, default=None, help=h("eval_samples", "每轮评估抽样数量，<=0 表示全量"))
+	parser.add_argument("--eval_max_len", type=int, default=None, help=h("eval_max_len", "评估解码最大长度"))
+	parser.add_argument("--eval_max_iter", type=int, default=None, help=h("eval_max_iter", "评估迭代解码步数"))
 
 	eval_group = parser.add_mutually_exclusive_group()
-	eval_group.add_argument("--skip_eval", dest="skip_eval", action="store_true", help="仅训练不做评估")
-	eval_group.add_argument("--enable_eval", dest="skip_eval", action="store_false", help="启用训练期评估")
+	eval_group.add_argument("--skip_eval", dest="skip_eval", action="store_true", help=h("skip_eval", "仅训练不做评估"))
+	eval_group.add_argument("--enable_eval", dest="skip_eval", action="store_false", help=h("enable_eval", "启用训练期评估"))
 	parser.set_defaults(skip_eval=None)
 
-	parser.add_argument("--ckpt_dir", type=str, default=None)
-	parser.add_argument("--log_dir", type=str, default=None)
-	parser.add_argument("--resume_ckpt", type=str, default=None)
+	parser.add_argument("--ckpt_dir", type=str, default=None, help=h("ckpt_dir", "checkpoint 输出目录"))
+	parser.add_argument("--log_dir", type=str, default=None, help=h("log_dir", "日志输出目录"))
+	parser.add_argument("--resume_ckpt", type=str, default=None, help=h("resume_ckpt", "恢复训练的 checkpoint 路径"))
 
 	resume_group = parser.add_mutually_exclusive_group()
-	resume_group.add_argument("--resume", dest="resume", action="store_true", help="从 resume_ckpt 恢复完整训练状态")
-	resume_group.add_argument("--fresh_start", dest="resume", action="store_false", help="不恢复断点，冷启动训练")
+	resume_group.add_argument("--resume", dest="resume", action="store_true", help=h("resume", "从 resume_ckpt 恢复完整训练状态"))
+	resume_group.add_argument("--fresh_start", dest="resume", action="store_false", help=h("fresh_start", "不恢复断点，冷启动训练"))
 	parser.set_defaults(resume=None)
 
 	return parser.parse_args()
@@ -113,6 +130,18 @@ def apply_config_defaults(args: argparse.Namespace, train_cfg: Dict[str, Any], m
 	args.num_workers = args.num_workers if args.num_workers is not None else int(_cfg_get(train_cfg, ("training", "num_workers"), 4))
 	args.epochs = args.epochs if args.epochs is not None else int(_cfg_get(train_cfg, ("training", "epochs"), 20))
 	args.seed = args.seed if args.seed is not None else int(_cfg_get(train_cfg, ("training", "seed"), 42))
+
+	cfg_mix_ratio = _cfg_get(train_cfg, ("training", "mix_ratio"), None)
+	if args.mix_ratio is None:
+		if cfg_mix_ratio is None:
+			args.mix_ratio = [1] * len(args.train_h5)
+		else:
+			args.mix_ratio = [int(v) for v in cfg_mix_ratio]
+	else:
+		args.mix_ratio = [int(v) for v in args.mix_ratio]
+
+	args.epoch_samples = args.epoch_samples if args.epoch_samples is not None else int(_cfg_get(train_cfg, ("training", "epoch_samples"), 0))
+	args.bucket_mega_factor = args.bucket_mega_factor if args.bucket_mega_factor is not None else int(_cfg_get(train_cfg, ("training", "bucket_mega_factor"), 30))
 
 	args.encoder_lr = args.encoder_lr if args.encoder_lr is not None else float(_cfg_get(train_cfg, ("optimization", "encoder_lr"), 5e-5))
 	args.decoder_lr = args.decoder_lr if args.decoder_lr is not None else float(_cfg_get(train_cfg, ("optimization", "decoder_lr"), 1e-4))
@@ -182,6 +211,112 @@ def build_optimizer(model: LatexOCRModel, encoder_lr: float, decoder_lr: float, 
 		],
 		weight_decay=weight_decay,
 	)
+
+
+class RatioBucketBatchSampler(Sampler[List[int]]):
+	"""分桶后随机采样器：先按数据源比例抽样，再按宽高比局部排序，最后随机打散 batch。"""
+
+	def __init__(
+		self,
+		lengths: Sequence[int],
+		aspect_ratios: Sequence[np.ndarray],
+		ratios: Sequence[int],
+		total_samples: int,
+		batch_size: int,
+		seed: int = 42,
+		mega_factor: int = 30,
+		drop_last: bool = True,
+	):
+		if len(lengths) != len(ratios) or len(lengths) != len(aspect_ratios):
+			raise ValueError("lengths/ratios/aspect_ratios 长度不一致")
+		if any(length <= 0 for length in lengths):
+			raise ValueError(f"存在空数据集，无法混采: {lengths}")
+		if any(ratio <= 0 for ratio in ratios):
+			raise ValueError(f"ratio 必须全为正整数: {ratios}")
+		if total_samples <= 0:
+			raise ValueError(f"total_samples 必须 > 0，当前为 {total_samples}")
+		if batch_size <= 0:
+			raise ValueError(f"batch_size 必须 > 0，当前为 {batch_size}")
+
+		self.lengths = [int(v) for v in lengths]
+		self.aspect_ratios = [np.asarray(v, dtype=np.float32) for v in aspect_ratios]
+		self.ratios = [int(v) for v in ratios]
+		self.total_samples = int(total_samples)
+		self.batch_size = int(batch_size)
+		self.seed = int(seed)
+		self.mega_factor = max(1, int(mega_factor))
+		self.drop_last = bool(drop_last)
+		self.epoch = 0
+
+		self.offsets: List[int] = []
+		running = 0
+		for length in self.lengths:
+			self.offsets.append(running)
+			running += length
+
+		self.target_counts = self._build_target_counts(self.total_samples)
+		self.sample_count = int(sum(self.target_counts))
+		if self.drop_last:
+			self.batch_count = self.sample_count // self.batch_size
+		else:
+			self.batch_count = (self.sample_count + self.batch_size - 1) // self.batch_size
+
+	def _build_target_counts(self, total_samples: int) -> List[int]:
+		ratio_sum = sum(self.ratios)
+		raw_counts = [total_samples * ratio / ratio_sum for ratio in self.ratios]
+		int_counts = [int(c) for c in raw_counts]
+		remain = int(total_samples - sum(int_counts))
+
+		if remain > 0:
+			frac_with_idx = sorted(
+				[(raw_counts[i] - int_counts[i], i) for i in range(len(int_counts))],
+				key=lambda x: x[0],
+				reverse=True,
+			)
+			for j in range(remain):
+				int_counts[frac_with_idx[j % len(frac_with_idx)][1]] += 1
+
+		return int_counts
+
+	def set_epoch(self, epoch: int) -> None:
+		self.epoch = int(epoch)
+
+	def __iter__(self):
+		rng = random.Random(self.seed + self.epoch)
+		pool: List[Tuple[int, float]] = []
+
+		for length, ars, need, offset in zip(self.lengths, self.aspect_ratios, self.target_counts, self.offsets):
+			if need <= length:
+				local_indices = rng.sample(range(length), k=need)
+			else:
+				local_indices = [rng.randrange(length) for _ in range(need)]
+
+			for local_idx in local_indices:
+				aspect = float(ars[local_idx]) if local_idx < len(ars) else 1.0
+				pool.append((offset + local_idx, aspect))
+
+		rng.shuffle(pool)
+
+		mega_size = self.batch_size * self.mega_factor
+		batches: List[List[int]] = []
+		for start in range(0, len(pool), mega_size):
+			mega = pool[start: start + mega_size]
+			mega.sort(key=lambda item: item[1] + rng.uniform(-1e-6, 1e-6))
+
+			for i in range(0, len(mega), self.batch_size):
+				chunk = mega[i: i + self.batch_size]
+				if len(chunk) < self.batch_size and self.drop_last:
+					continue
+				batch_indices = [idx for idx, _ in chunk]
+				rng.shuffle(batch_indices)
+				batches.append(batch_indices)
+
+		rng.shuffle(batches)
+		for batch in batches:
+			yield batch
+
+	def __len__(self) -> int:
+		return self.batch_count
 
 
 def collate_eval_batch(batch, pad_token_id: int) -> Dict[str, torch.Tensor]:
@@ -398,6 +533,26 @@ def main() -> None:
 	]
 	train_dataset = datasets[0] if len(datasets) == 1 else ConcatDataset(datasets)
 
+	if len(args.mix_ratio) != len(datasets):
+		raise ValueError(
+			f"mix_ratio 长度({len(args.mix_ratio)})必须与训练数据集数量({len(datasets)})一致"
+		)
+
+	dataset_lengths = [len(ds) for ds in datasets]
+	aspect_ratios = [np.asarray(ds.aspect_ratios, dtype=np.float32) for ds in datasets]
+	epoch_samples = int(args.epoch_samples) if int(args.epoch_samples) > 0 else int(sum(dataset_lengths))
+
+	train_batch_sampler = RatioBucketBatchSampler(
+		lengths=dataset_lengths,
+		aspect_ratios=aspect_ratios,
+		ratios=[int(v) for v in args.mix_ratio],
+		total_samples=epoch_samples,
+		batch_size=args.batch_size,
+		seed=args.seed,
+		mega_factor=args.bucket_mega_factor,
+		drop_last=True,
+	)
+
 	collate_fn = MLMCollate(
 		pad_token_id=pad_id,
 		mask_token_id=mask_id,
@@ -408,8 +563,7 @@ def main() -> None:
 
 	train_loader = DataLoader(
 		train_dataset,
-		batch_size=args.batch_size,
-		shuffle=True,
+		batch_sampler=train_batch_sampler,
 		collate_fn=collate_fn,
 		num_workers=args.num_workers,
 		pin_memory=(device.type == "cuda"),
@@ -444,8 +598,8 @@ def main() -> None:
 		weight_decay=args.weight_decay,
 	)
 
-	total_steps = infer_total_steps(args.epochs, len(train_loader))
-	warmup_steps = int(args.warmup_epochs * len(train_loader))
+	total_steps = infer_total_steps(args.epochs, len(train_batch_sampler))
+	warmup_steps = int(args.warmup_epochs * len(train_batch_sampler))
 	scheduler = build_linear_warmup_cosine_scheduler(
 		optimizer=optimizer,
 		total_steps=total_steps,
@@ -489,12 +643,14 @@ def main() -> None:
 	print(f"TrainConfig={args.train_config}")
 	print(f"ModelConfig={args.model_config}")
 	print(f"Datasets={dataset_paths}")
+	print(f"MixRatio={args.mix_ratio} | EpochSamples={train_batch_sampler.sample_count} | TrainBatches={len(train_batch_sampler)}")
 	if not args.skip_eval:
 		print(f"EvalSet={args.eval_h5} | EvalBatch={args.eval_batch_size} | EvalSamples={args.eval_samples}")
 	print(f"Total Steps={total_steps}, Warmup Steps={warmup_steps}")
 	print("=" * 80)
 
 	for epoch in range(start_epoch, args.epochs + 1):
+		train_batch_sampler.set_epoch(epoch)
 		avg_loss, avg_acc = trainer.train_epoch(train_loader, epoch=epoch, log_interval=args.log_interval)
 
 		eval_processed = 0.0
