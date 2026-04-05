@@ -29,15 +29,17 @@ def calculate_dynamic_dims(h_orig: int, w_orig: int, max_area: int = 98304, min_
     return aligned_h, aligned_w
 
 class MLMFormulaDataset(Dataset):
-    def __init__(self, h5_path: str, tokenizer_path: str, max_area: int = 98304):
+    def __init__(self, h5_path: str, tokenizer_path: str, max_area: int = 98304, enable_augment: bool = False):
         """
         Args:
             h5_path: HDF5 数据集路径
             tokenizer_path: BPE 分词器 JSON 文件路径
             max_area: 最大图像面积限制
+            enable_augment: 是否启用在线增强（建议仅训练集开启）
         """
         self.h5_path = h5_path
         self.max_area = max_area
+        self.enable_augment = bool(enable_augment)
         
         # 加载 BPE 分词器
         self.tokenizer = Tokenizer.from_file(tokenizer_path)
@@ -47,13 +49,27 @@ class MLMFormulaDataset(Dataset):
             labels_ds: Any = f['labels']
             self.length = int(labels_ds.shape[0])
             if 'widths' in f and 'heights' in f:
-                widths = np.asarray(f['widths'][:], dtype=np.float32)
-                heights = np.asarray(f['heights'][:], dtype=np.float32)
+                widths_ds: Any = f['widths']
+                heights_ds: Any = f['heights']
+                widths = np.asarray(widths_ds[:], dtype=np.float32)
+                heights = np.asarray(heights_ds[:], dtype=np.float32)
                 heights = np.maximum(heights, 1.0)
                 self.aspect_ratios = widths / heights
+
+                # 预估动态缩放后的面积，作为分桶的内存代理特征。
+                target_h = np.sqrt(float(self.max_area) / self.aspect_ratios)
+                target_w = target_h * self.aspect_ratios
+                aligned_h = np.maximum(32.0, np.round(target_h / 32.0) * 32.0)
+                aligned_w = np.maximum(32.0, np.round(target_w / 32.0) * 32.0)
+                self.resized_heights = aligned_h.astype(np.float32)
+                self.resized_widths = aligned_w.astype(np.float32)
+                self.resized_areas = aligned_h * aligned_w
             else:
                 # 回退：缺少宽高元数据时使用常数，避免分桶流程崩溃
                 self.aspect_ratios = np.ones((self.length,), dtype=np.float32)
+                self.resized_heights = np.full((self.length,), 256.0, dtype=np.float32)
+                self.resized_widths = np.full((self.length,), 384.0, dtype=np.float32)
+                self.resized_areas = np.ones((self.length,), dtype=np.float32)
             
         # 工作进程专用的 h5 句柄 (避免多进程 Dataloader 发生死锁)
         self.h5_file = None
@@ -114,6 +130,20 @@ class MLMFormulaDataset(Dataset):
         
         if h_orig != target_h or w_orig != target_w:
             img = cv2.resize(img, (target_w, target_h), interpolation=cv2.INTER_AREA)
+
+        # 训练专用在线增强：轻量噪声与对比度扰动，降低过拟合
+        if self.enable_augment:
+            img_float = img.astype(np.float32)
+
+            if np.random.rand() < 0.2:
+                noise = np.random.randn(*img_float.shape) * np.random.uniform(2.0, 8.0)
+                img_float = img_float + noise
+
+            if np.random.rand() < 0.3:
+                alpha = np.random.uniform(0.7, 1.2)
+                img_float = img_float * alpha
+
+            img = np.clip(img_float, 0.0, 255.0).astype(np.uint8)
             
         # 转换为 Tensor，归一化到 [0, 1] 并增加通道维度 [1, H, W]
         img_tensor = torch.from_numpy(img).float().unsqueeze(0) / 255.0

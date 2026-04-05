@@ -153,6 +153,15 @@ def apply_config_defaults(args: argparse.Namespace, train_cfg: Dict[str, Any], m
 	args.eta_min = args.eta_min if args.eta_min is not None else float(_cfg_get(train_cfg, ("scheduler", "eta_min"), 1e-6))
 
 	args.mask_prob = args.mask_prob if args.mask_prob is not None else float(_cfg_get(train_cfg, ("mlm", "mask_prob"), 0.15))
+	args.dynamic_mask_prob = bool(_cfg_get(train_cfg, ("mlm", "dynamic_mask_prob"), False))  # 是否启用动态掩码比例
+	args.dynamic_mask_min = float(_cfg_get(train_cfg, ("mlm", "dynamic_mask_min"), 0.1))
+	args.dynamic_mask_max = float(_cfg_get(train_cfg, ("mlm", "dynamic_mask_max"), 1.0))
+	if args.dynamic_mask_min > args.dynamic_mask_max:
+		raise ValueError(
+			f"mlm.dynamic_mask_min 不能大于 mlm.dynamic_mask_max，当前为 {args.dynamic_mask_min}>{args.dynamic_mask_max}"
+		)
+
+	args.label_smoothing = float(_cfg_get(train_cfg, ("optimization", "label_smoothing"), 0.1))
 
 	args.log_interval = args.log_interval if args.log_interval is not None else int(_cfg_get(train_cfg, ("logging", "log_interval"), 20))
 	args.eval_interval = args.eval_interval if args.eval_interval is not None else int(_cfg_get(train_cfg, ("eval", "eval_interval"), 1))
@@ -172,6 +181,11 @@ def apply_config_defaults(args: argparse.Namespace, train_cfg: Dict[str, Any], m
 	args.ckpt_dir = args.ckpt_dir or str(_cfg_get(train_cfg, ("runtime", "ckpt_dir"), r"checkpoints\mlm"))
 	args.log_dir = args.log_dir or str(_cfg_get(train_cfg, ("runtime", "log_dir"), r"logs\mlm_logs"))
 	args.resume_ckpt = args.resume_ckpt or str(_cfg_get(train_cfg, ("runtime", "resume_ckpt"), r"checkpoints\mlm\latest.pth"))
+	args.cudnn_benchmark = bool(_cfg_get(train_cfg, ("runtime", "cudnn_benchmark"), True))
+	args.kernel_warmup_batches = int(_cfg_get(train_cfg, ("runtime", "kernel_warmup_batches"), 8))
+    
+	if args.kernel_warmup_batches < 0:
+		raise ValueError(f"runtime.kernel_warmup_batches 不能小于 0，当前为 {args.kernel_warmup_batches}")
 
 	if args.resume is None:
 		args.resume = bool(_cfg_get(train_cfg, ("runtime", "resume"), False))
@@ -219,21 +233,31 @@ def build_optimizer(model: LatexOCRModel, encoder_lr: float, decoder_lr: float, 
 
 
 class RatioBucketBatchSampler(Sampler[List[int]]):
-	"""分桶后随机采样器：先按数据源比例抽样，再按宽高比局部排序，最后随机打散 batch。"""
+	"""分桶后随机采样器：按比例抽样后先做宽高比分箱，再在箱内按面积排序。"""
 
 	def __init__(
 		self,
 		lengths: Sequence[int],
 		aspect_ratios: Sequence[np.ndarray],
+		area_values: Sequence[np.ndarray],
+		height_values: Sequence[np.ndarray],
+		width_values: Sequence[np.ndarray],
 		ratios: Sequence[int],
 		total_samples: int,
 		batch_size: int,
 		seed: int = 42,
 		mega_factor: int = 30,
+		aspect_bin_edges: Sequence[float] = (0.55, 0.75, 0.9, 1.1, 1.35, 1.7, 2.2, 3.0, 4.2, 6.0),
 		drop_last: bool = True,
 	):
-		if len(lengths) != len(ratios) or len(lengths) != len(aspect_ratios):
-			raise ValueError("lengths/ratios/aspect_ratios 长度不一致")
+		if (
+			len(lengths) != len(ratios)
+			or len(lengths) != len(aspect_ratios)
+			or len(lengths) != len(area_values)
+			or len(lengths) != len(height_values)
+			or len(lengths) != len(width_values)
+		):
+			raise ValueError("lengths/ratios/aspect_ratios/area_values/height_values/width_values 长度不一致")
 		if any(length <= 0 for length in lengths):
 			raise ValueError(f"存在空数据集，无法混采: {lengths}")
 		if any(ratio <= 0 for ratio in ratios):
@@ -245,11 +269,15 @@ class RatioBucketBatchSampler(Sampler[List[int]]):
 
 		self.lengths = [int(v) for v in lengths]
 		self.aspect_ratios = [np.asarray(v, dtype=np.float32) for v in aspect_ratios]
+		self.area_values = [np.asarray(v, dtype=np.float32) for v in area_values]
+		self.height_values = [np.asarray(v, dtype=np.float32) for v in height_values]
+		self.width_values = [np.asarray(v, dtype=np.float32) for v in width_values]
 		self.ratios = [int(v) for v in ratios]
 		self.total_samples = int(total_samples)
 		self.batch_size = int(batch_size)
 		self.seed = int(seed)
 		self.mega_factor = max(1, int(mega_factor))
+		self.aspect_bin_edges = tuple(float(v) for v in aspect_bin_edges)
 		self.drop_last = bool(drop_last)
 		self.epoch = 0
 
@@ -286,11 +314,25 @@ class RatioBucketBatchSampler(Sampler[List[int]]):
 	def set_epoch(self, epoch: int) -> None:
 		self.epoch = int(epoch)
 
+	def _aspect_bin(self, aspect: float) -> int:
+		for i, edge in enumerate(self.aspect_bin_edges):
+			if aspect < edge:
+				return i
+		return len(self.aspect_bin_edges)
+
 	def __iter__(self):
 		rng = random.Random(self.seed + self.epoch)
-		pool: List[Tuple[int, float]] = []
+		pool: List[Tuple[int, int, float, float, float]] = []
 
-		for length, ars, need, offset in zip(self.lengths, self.aspect_ratios, self.target_counts, self.offsets):
+		for length, ars, areas, hs, ws, need, offset in zip(
+			self.lengths,
+			self.aspect_ratios,
+			self.area_values,
+			self.height_values,
+			self.width_values,
+			self.target_counts,
+			self.offsets,
+		):
 			if need <= length:
 				local_indices = rng.sample(range(length), k=need)
 			else:
@@ -298,27 +340,44 @@ class RatioBucketBatchSampler(Sampler[List[int]]):
 
 			for local_idx in local_indices:
 				aspect = float(ars[local_idx]) if local_idx < len(ars) else 1.0
-				pool.append((offset + local_idx, aspect))
+				area = float(areas[local_idx]) if local_idx < len(areas) else 1.0
+				h = float(hs[local_idx]) if local_idx < len(hs) else 256.0
+				w = float(ws[local_idx]) if local_idx < len(ws) else 384.0
+				aspect_bin = self._aspect_bin(aspect)
+				# 以 area 归一后叠加 h/w，兼顾规模与形状接近性。
+				shape_score = area + (h * 1e-1) + (w * 1e-3)
+				pool.append((offset + local_idx, aspect_bin, h, w, shape_score))
 
 		rng.shuffle(pool)
 
 		mega_size = self.batch_size * self.mega_factor
-		batches: List[List[int]] = []
-		for start in range(0, len(pool), mega_size):
+		mega_starts = list(range(0, len(pool), mega_size))
+		rng.shuffle(mega_starts)
+
+		for start in mega_starts:
 			mega = pool[start: start + mega_size]
-			mega.sort(key=lambda item: item[1] + rng.uniform(-1e-6, 1e-6))
+			bin_groups: Dict[int, List[Tuple[int, int, float, float, float]]] = {}
+			for item in mega:
+				bin_groups.setdefault(item[1], []).append(item)
 
-			for i in range(0, len(mega), self.batch_size):
-				chunk = mega[i: i + self.batch_size]
-				if len(chunk) < self.batch_size and self.drop_last:
-					continue
-				batch_indices = [idx for idx, _ in chunk]
-				rng.shuffle(batch_indices)
-				batches.append(batch_indices)
+			local_batches: List[List[int]] = []
+			bin_ids = list(bin_groups.keys())
+			rng.shuffle(bin_ids)
+			for bin_id in bin_ids:
+				group = bin_groups[bin_id]
+				group.sort(key=lambda item: (item[2], item[3], item[4] + rng.uniform(-1e-6, 1e-6)))
 
-		rng.shuffle(batches)
-		for batch in batches:
-			yield batch
+				for i in range(0, len(group), self.batch_size):
+					chunk = group[i: i + self.batch_size]
+					if len(chunk) < self.batch_size and self.drop_last:
+						continue
+					batch_indices = [idx for idx, _, _, _, _ in chunk]
+					rng.shuffle(batch_indices)
+					local_batches.append(batch_indices)
+
+			rng.shuffle(local_batches)
+			for batch in local_batches:
+				yield batch
 
 	def __len__(self) -> int:
 		return self.batch_count
@@ -495,6 +554,7 @@ def evaluate_epoch(
 			pbar.set_postfix({"EM": f"{em * 100:.2f}%", "NED": f"{avg_ned:.4f}"})
 
 	em_rate = (exact / processed) if processed > 0 else 0.0
+
 	avg_ned = (total_ned / processed) if processed > 0 else 1.0
 	stats = {
 		"processed": float(processed),
@@ -503,6 +563,43 @@ def evaluate_epoch(
 		"avg_ned": avg_ned,
 	}
 	return em_rate, error_counter, stats
+
+
+def warmup_kernel_cache(
+	model: LatexOCRModel,
+	train_loader: DataLoader,
+	device: torch.device,
+	amp_enabled: bool,
+	amp_dtype: torch.dtype,
+	warmup_batches: int,
+) -> int:
+	"""训练前执行少量前向预热，提前触发常见 shape 的内核/算法选择。"""
+	if warmup_batches <= 0:
+		return 0
+
+	model.train()
+	steps = 0
+	loader_iter = iter(train_loader)
+
+	with torch.no_grad():
+		for _ in range(int(warmup_batches)):
+			try:
+				batch = next(loader_iter)
+			except StopIteration:
+				break
+
+			images = batch["images"].to(device, non_blocking=True)
+			masked_token_ids = batch["masked_token_ids"].to(device, non_blocking=True)
+
+			with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+				_ = model(images=images, tgt_seq=masked_token_ids, is_causal=False)
+
+			steps += 1
+
+	if device.type == "cuda":
+		torch.cuda.synchronize()
+
+	return steps
 
 
 def main() -> None:
@@ -529,6 +626,9 @@ def main() -> None:
 		amp_dtype = torch.float32
 		amp_enabled = False
 
+	if device.type == "cuda":
+		torch.backends.cudnn.benchmark = bool(args.cudnn_benchmark)
+
 	tokenizer = Tokenizer.from_file(args.tokenizer)
 	vocab_size = tokenizer.get_vocab_size()
 
@@ -550,7 +650,7 @@ def main() -> None:
 		raise FileNotFoundError(f"训练集不存在，请检查路径: {args.train_h5}")
 
 	datasets = [
-		MLMFormulaDataset(h5_path=path, tokenizer_path=args.tokenizer, max_area=args.max_area)
+		MLMFormulaDataset(h5_path=path, tokenizer_path=args.tokenizer, max_area=args.max_area, enable_augment=True)
 		for path in dataset_paths
 	]
 	train_dataset = datasets[0] if len(datasets) == 1 else ConcatDataset(datasets)
@@ -562,11 +662,26 @@ def main() -> None:
 
 	dataset_lengths = [len(ds) for ds in datasets]
 	aspect_ratios = [np.asarray(ds.aspect_ratios, dtype=np.float32) for ds in datasets]
+	area_values = [
+		np.asarray(getattr(ds, "resized_areas", np.ones((len(ds),), dtype=np.float32)), dtype=np.float32)
+		for ds in datasets
+	]
+	height_values = [
+		np.asarray(getattr(ds, "resized_heights", np.full((len(ds),), 256.0, dtype=np.float32)), dtype=np.float32)
+		for ds in datasets
+	]
+	width_values = [
+		np.asarray(getattr(ds, "resized_widths", np.full((len(ds),), 384.0, dtype=np.float32)), dtype=np.float32)
+		for ds in datasets
+	]
 	epoch_samples = int(args.epoch_samples) if int(args.epoch_samples) > 0 else int(sum(dataset_lengths))
 
 	train_batch_sampler = RatioBucketBatchSampler(
 		lengths=dataset_lengths,
 		aspect_ratios=aspect_ratios,
+		area_values=area_values,
+		height_values=height_values,
+		width_values=width_values,
 		ratios=[int(v) for v in args.mix_ratio],
 		total_samples=epoch_samples,
 		batch_size=args.batch_size,
@@ -581,6 +696,9 @@ def main() -> None:
 		vocab_size=vocab_size,
 		special_token_ids=special_token_ids,
 		mask_prob=args.mask_prob,
+		dynamic_mask_prob=args.dynamic_mask_prob,
+		dynamic_mask_min=args.dynamic_mask_min,
+		dynamic_mask_max=args.dynamic_mask_max,
 	)
 
 	train_loader = DataLoader(
@@ -639,6 +757,7 @@ def main() -> None:
 		scaler=scaler,
 		amp_enabled=amp_enabled,
 		amp_dtype=amp_dtype,
+		label_smoothing=args.label_smoothing,
 	)
 
 	start_epoch = 1
@@ -663,15 +782,31 @@ def main() -> None:
 			f.write("Timestamp\tEpoch\tLoss\tMaskAcc(%)\tEvalProcessed\tEvalExact\tEvalEM(%)\tEvalNED\tLREnc\tLRDec\n")
 
 	print("=" * 80)
-	print(f"MLM 训练启动 | Device={device} | AMP={amp_enabled} | AMP_DTYPE={args.amp_dtype}")
+	print(
+		f"MLM 训练启动 | Device={device} | AMP={amp_enabled} | AMP_DTYPE={args.amp_dtype} | "
+		f"MaskProb={args.mask_prob} | DynamicMask={args.dynamic_mask_prob} | LabelSmoothing={args.label_smoothing}"
+	)
 	print(f"TrainConfig={args.train_config}")
 	print(f"ModelConfig={args.model_config}")
 	print(f"Datasets={dataset_paths}")
 	print(f"MixRatio={args.mix_ratio} | EpochSamples={train_batch_sampler.sample_count} | TrainBatches={len(train_batch_sampler)}")
+	print(f"cudnn.benchmark={torch.backends.cudnn.benchmark} | KernelWarmupBatches={args.kernel_warmup_batches}")
 	if not args.skip_eval:
 		print(f"EvalSet={args.eval_h5} | EvalBatch={args.eval_batch_size} | EvalSamples={args.eval_samples}")
 	print(f"Total Steps={total_steps}, Warmup Steps={warmup_steps}")
 	print("=" * 80)
+
+	train_batch_sampler.set_epoch(start_epoch)
+	warmed = warmup_kernel_cache(
+		model=model,
+		train_loader=train_loader,
+		device=device,
+		amp_enabled=amp_enabled,
+		amp_dtype=amp_dtype,
+		warmup_batches=args.kernel_warmup_batches,
+	)
+	if warmed > 0:
+		print(f"内核预热完成: {warmed} batches")
 
 	for epoch in range(start_epoch, args.epochs + 1):
 		train_batch_sampler.set_epoch(epoch)

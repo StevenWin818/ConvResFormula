@@ -12,7 +12,7 @@ training:
   num_workers: 4 # 训练 DataLoader 线程数
   epochs: 20 # 总训练轮数
   seed: 42 # 随机种子
-  mix_ratio: [1, 1, 1] # 多数据源采样比例，手写:合成:单字符
+  mix_ratio: [10, 10, 1] # 多数据源采样比例，手写:合成:单字符
   epoch_samples: 0 # 每个 epoch 的采样总数，<=0 表示全量
   bucket_mega_factor: 30 # 分桶 mega-batch 系数
 
@@ -20,6 +20,7 @@ optimization:
   encoder_lr: 5.0e-5 # 编码器学习率
   decoder_lr: 1.0e-4 # 解码器学习率
   weight_decay: 1.0e-2 # AdamW 权重衰减
+  label_smoothing: 0.1 # 交叉熵标签平滑，提升泛化能力
 
 scheduler:
   warmup_epochs: 1.0 # 线性预热轮数
@@ -28,6 +29,9 @@ scheduler:
 
 mlm:
   mask_prob: 0.15 # MLM 掩码比例
+  dynamic_mask_prob: true # 是否按 batch 随机采样掩码率
+  dynamic_mask_min: 0.1 # 动态掩码下限
+  dynamic_mask_max: 1.0 # 动态掩码上限
 
 logging:
   log_interval: 20 # 训练日志打印间隔(step)
@@ -47,6 +51,8 @@ runtime:
   resume_ckpt: checkpoints/mlm/latest.pth # 恢复训练使用的 checkpoint
   resume: false # 是否默认启用断点恢复
   amp_dtype: fp16 # 训练精度类型(fp16/bf16/fp32)
+  cudnn_benchmark: true # 为固定/重复 shape 自动选择更快内核
+  kernel_warmup_batches: 2 # 训练前预热批次数，过大可能显著拉长首轮启动
 
 cli_help:
   description: ConvNeXt-V2 + AttnRes 的 MLM 训练脚本

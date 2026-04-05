@@ -5,7 +5,17 @@ import torch
 from torch.nn.utils.rnn import pad_sequence
 
 class MLMCollate:
-    def __init__(self, pad_token_id, mask_token_id, vocab_size, special_token_ids, mask_prob=0.15):
+    def __init__(
+        self,
+        pad_token_id,
+        mask_token_id,
+        vocab_size,
+        special_token_ids,
+        mask_prob=0.15,
+        dynamic_mask_prob=False,
+        dynamic_mask_min=0.1,
+        dynamic_mask_max=1.0,
+    ):
         """
         初始化 MLM 动态批处理。
         
@@ -15,12 +25,29 @@ class MLMCollate:
             vocab_size (int): 词表大小，用于随机词替换
             special_token_ids (set or list): 特殊 Token 的 ID 集合 (如 PAD, UNK, BOS, EOS, MASK)，这些不会被掩盖
             mask_prob (float): 掩盖概率，默认 15% (0.15)
+            dynamic_mask_prob (bool): 是否按 batch 随机采样掩码概率
+            dynamic_mask_min (float): 动态掩码下限
+            dynamic_mask_max (float): 动态掩码上限
         """
         self.pad_token_id = pad_token_id
         self.mask_token_id = mask_token_id
         self.vocab_size = vocab_size
         self.special_token_ids = set(special_token_ids)
         self.mask_prob = mask_prob
+        self.dynamic_mask_prob = bool(dynamic_mask_prob)
+        self.dynamic_mask_min = float(dynamic_mask_min)
+        self.dynamic_mask_max = float(dynamic_mask_max)
+
+        if not (0.0 <= self.mask_prob <= 1.0):
+            raise ValueError(f"mask_prob 必须在 [0,1]，当前为 {self.mask_prob}")
+        if not (0.0 <= self.dynamic_mask_min <= 1.0 and 0.0 <= self.dynamic_mask_max <= 1.0):
+            raise ValueError(
+                f"dynamic_mask_min/max 必须在 [0,1]，当前为 {self.dynamic_mask_min}/{self.dynamic_mask_max}"
+            )
+        if self.dynamic_mask_min > self.dynamic_mask_max:
+            raise ValueError(
+                f"dynamic_mask_min 不能大于 dynamic_mask_max，当前为 {self.dynamic_mask_min}>{self.dynamic_mask_max}"
+            )
 
     def __call__(self, batch):
         """
@@ -56,39 +83,47 @@ class MLMCollate:
             images = batched_images
                 
         # 2. 组装 Token 序列并填充 Padding
-        input_ids = pad_sequence(input_ids_list, batch_first=True, padding_value=self.pad_token_id)
-        
-        # 默认 Labels 和输入完全一致
-        labels = input_ids.clone()
+        clean_token_ids = pad_sequence(input_ids_list, batch_first=True, padding_value=self.pad_token_id)
+
+        # 保留一份“干净序列”给未来 AR 分支，MLM 分支在副本上做掩盖
+        masked_token_ids = clean_token_ids.clone()
+        mlm_labels = clean_token_ids.clone()
         
         # 3. 动态 MLM 掩盖策略
+        cur_mask_prob = self.mask_prob
+        if self.dynamic_mask_prob:
+            cur_mask_prob = float(torch.empty(1).uniform_(self.dynamic_mask_min, self.dynamic_mask_max).item())
+
         # 创建与输入形状一致的概率矩阵
-        probability_matrix = torch.full(labels.shape, self.mask_prob)
+        probability_matrix = torch.full(mlm_labels.shape, cur_mask_prob)
         
-        # (重要) 保护特殊 Token，不要将 [PAD], [BOS], [EOS] 等变成 [MASK]
+        # 保护特殊 Token，不要将 [PAD], [BOS], [EOS] 等变成 [MASK]
         for special_id in self.special_token_ids:
-            probability_matrix.masked_fill_(labels == special_id, value=0.0)
+            probability_matrix.masked_fill_(mlm_labels == special_id, value=0.0)
             
         # 使用伯努利分布采样，生成 15% 的掩盖掩码 (True 表示选中该位置)
         masked_indices = torch.bernoulli(probability_matrix).bool()
         
         # 【Label 忽略机制】没有被选中的 Token (即不需要模型进行预测的位置)，将其 Label 设为 -100
-        labels[~masked_indices] = -100
+        mlm_labels[~masked_indices] = -100
 
         # 在选中的 15% 中：
         # 【80% 替换为 [MASK]】
-        indices_replaced = torch.bernoulli(torch.full(labels.shape, 0.8)).bool() & masked_indices
-        input_ids[indices_replaced] = self.mask_token_id
+        indices_replaced = torch.bernoulli(torch.full(mlm_labels.shape, 0.8)).bool() & masked_indices
+        masked_token_ids[indices_replaced] = self.mask_token_id
 
         # 【10% 替换为随机词】 (在剩下的 20% 里随机选一半，即 10%)
-        indices_random = torch.bernoulli(torch.full(labels.shape, 0.5)).bool() & masked_indices & ~indices_replaced
-        random_words = torch.randint(0, self.vocab_size, labels.shape, dtype=torch.long)
-        input_ids[indices_random] = random_words[indices_random]
+        indices_random = torch.bernoulli(torch.full(mlm_labels.shape, 0.5)).bool() & masked_indices & ~indices_replaced
+        random_words = torch.randint(0, self.vocab_size, mlm_labels.shape, dtype=torch.long)
+        masked_token_ids[indices_random] = random_words[indices_random]
 
         # 【10% 保持不变】 (已被 masked_indices 选中，但没有被替换，所以保持原始 token id 不变，且 label 不是 -100)
         
         return {
             "images": images,
-            "masked_token_ids": input_ids,
-            "labels": labels
+            "clean_token_ids": clean_token_ids,
+            "masked_token_ids": masked_token_ids,
+            "mlm_labels": mlm_labels,
+            # 保持向后兼容，旧训练器仍可读取 labels
+            "labels": mlm_labels,
         }
