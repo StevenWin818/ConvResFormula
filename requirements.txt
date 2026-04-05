@@ -1,0 +1,1 @@
+# Python dependencies for ConvNeXt-V2 + AttnRes + MLM pipeline

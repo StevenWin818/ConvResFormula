@@ -1,0 +1,58 @@
+# Python 编译缓存
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# 虚拟环境
+venv/
+env/
+.env/
+.venv/
+pip-wheel-metadata/
+
+# 模型权重
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.onnx
+
+# 重组后的权重归档（内容被忽略，但保留目录结构）
+/checkpoints/*
+!/checkpoints/.gitkeep
+!/checkpoints/1d_phase1_to_3/.gitkeep
+!/checkpoints/lm_v1/.gitkeep
+!/checkpoints/2d_v1/.gitkeep
+
+# 训练与测试数据（注意：src/data/ 是源代码目录，不被忽略）
+# 仅忽略根目录的 data/ 和数据文件格式
+/datasets/
+/data/
+*.inkml
+*.hdf5
+*.npz
+
+# 日志文件与记录（内容被忽略，但保留目录结构）
+/logs/*
+!/logs/.gitkeep
+!/logs/1d_logs/.gitkeep
+!/logs/2d_logs/.gitkeep
+
+# 临时文件
+/temp/
+*.log
+*.bak
+
+# 缓存目录
+/cache/
+!/cache/vocab.pkl
+!/cache/latex_synonyms.txt
+
+# VS Code 配置
+.vscode/*
+!.vscode/launch.json
+!.vscode/tasks.json
+*.code-workspace
+.gemini/
+.github/copilot-instructions.md
