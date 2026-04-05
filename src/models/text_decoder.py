@@ -25,12 +25,12 @@ class AttnResDecoderLayer(nn.Module):
         
         self.activation = nn.GELU() if activation == "gelu" else nn.ReLU()
 
-    def forward(self, tgt, cross_features, tgt_key_padding_mask=None, memory_key_padding_mask=None):
-        # 1. Pre-Norm Self Attention (完全废弃因果掩码 / Causal Mask)
+    def forward(self, tgt, cross_features, tgt_mask=None, tgt_key_padding_mask=None, memory_key_padding_mask=None):
+        # 1. Pre-Norm Self Attention
         tgt2 = self.norm1(tgt)
-        # 绝对不传入 attn_mask，从而实现前后文双向注意力，允许偷看前后的 [MASK] 对应的信息
+        # 通过 tgt_mask 支持 AR(因果) 与 MLM(双向) 两种模式动态切换
         tgt2, _ = self.self_attn(tgt2, tgt2, tgt2, 
-                                 attn_mask=None,  
+                                 attn_mask=tgt_mask,
                                  key_padding_mask=tgt_key_padding_mask)
         # 残差连接
         tgt = tgt + self.dropout1(tgt2)
@@ -69,7 +69,7 @@ class AttnResTextDecoder(nn.Module):
         # 由于是 Pre-Norm，在最后输出前需要经过一次整体的 LayerNorm
         self.norm = nn.LayerNorm(d_model)
 
-    def forward(self, text_embeddings, cross_features, tgt_key_padding_mask=None, memory_key_padding_mask=None):
+    def forward(self, text_embeddings, cross_features, tgt_mask=None, tgt_key_padding_mask=None, memory_key_padding_mask=None):
         """
         Args:
             text_embeddings: (Batch, SeqLen, d_model) 融合了 Token 和 Positional Embedding 的文本特征
@@ -84,6 +84,7 @@ class AttnResTextDecoder(nn.Module):
         
         for layer in self.layers:
             x = layer(x, cross_features, 
+                      tgt_mask=tgt_mask,
                       tgt_key_padding_mask=tgt_key_padding_mask,
                       memory_key_padding_mask=memory_key_padding_mask)
                       
