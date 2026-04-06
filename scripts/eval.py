@@ -1,4 +1,4 @@
-"""并行解码评估脚本入口。"""
+"""AR 贪心解码评估脚本入口。"""
 
 import argparse
 import os
@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 import torch
+import torch.nn.functional as F
 from tokenizers import Tokenizer
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
@@ -19,22 +20,21 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
 	sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.data.dataset import MLMFormulaDataset
+from src.data.dataset import FormulaDataset
 from src.models.latex_ocr_model import LatexOCRModel
 def parse_args() -> argparse.Namespace:
-	parser = argparse.ArgumentParser(description="MLM 并行解码评估脚本")
+	parser = argparse.ArgumentParser(description="AR 贪心解码评估脚本")
 	parser.add_argument("--eval_h5", type=str, default=r"C:\Projects\LatexProject\ConvResFormula\datasets\val.h5")
 	parser.add_argument("--tokenizer", type=str, default=r"C:\Projects\LatexProject\ConvResFormula\tokenizer_bpe.json")
-	parser.add_argument("--checkpoint", type=str, default=r"checkpoints\mlm\best.pth")
+	parser.add_argument("--checkpoint", type=str, default=r"checkpoints\ar\best.pth")
 	parser.add_argument("--d_model", type=int, default=512)
 	parser.add_argument("--max_area", type=int, default=98304)
 	parser.add_argument("--batch_size", type=int, default=32)
 	parser.add_argument("--num_workers", type=int, default=2)
 	parser.add_argument("--max_len", type=int, default=160)
-	parser.add_argument("--max_iter", type=int, default=4)
 	parser.add_argument("--max_samples", type=int, default=0, help="评估样本数上限，<=0 表示全量")
 	parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-	parser.add_argument("--report_dir", type=str, default=r"logs\mlm_logs")
+	parser.add_argument("--report_dir", type=str, default=r"logs\ar_logs")
 	parser.add_argument("--log_interval", type=int, default=100)
 	return parser.parse_args()
 
@@ -86,55 +86,41 @@ def collate_eval_batch(batch, pad_token_id: int) -> Dict[str, torch.Tensor]:
 
 
 @torch.no_grad()
-def batched_infer_mlm_iterative(
+def batched_infer_ar(
 	model: LatexOCRModel,
 	images: torch.Tensor,
 	pad_id: int,
-	mask_id: int,
 	bos_id: int,
 	eos_id: int,
 	max_len: int,
-	max_iter: int,
 	amp_enabled: bool,
 ) -> List[List[int]]:
-	"""批量版 Mask-Predict 解码，用于评估提速。"""
+	"""批量版 AR 贪心解码。"""
 	batch_size = images.size(0)
 	device = images.device
 
-	token_ids = torch.full((batch_size, max_len), pad_id, dtype=torch.long, device=device)
-	token_ids[:, 0] = bos_id
-	if max_len > 1:
-		token_ids[:, 1:] = mask_id
-
-	# 视觉特征在一次迭代解码中保持不变，仅提取一次并复用
 	with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled):
 		memory = model.encode(images)
 
-	for step in range(max_iter):
+	downsampled_mask = F.max_pool2d(images, kernel_size=32, stride=32)
+	memory_padding_mask = (downsampled_mask.view(batch_size, -1) <= 1e-5)
+
+	generated = torch.full((batch_size, 1), bos_id, dtype=torch.long, device=device)
+	finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+	for _ in range(max_len - 1):
 		with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled):
-			logits = model.decode(memory=memory, tgt_seq=token_ids, is_causal=False)
+			logits = model.decode(memory, generated, memory_padding_mask, is_causal=True)
 
-		probs = torch.softmax(logits, dim=-1)
-		max_probs, preds = torch.max(probs, dim=-1)
-
-		is_mask = token_ids == mask_id
-		token_ids[is_mask] = preds[is_mask]
-
-		if step == max_iter - 1:
+		next_tokens = logits[:, -1, :].argmax(dim=-1)
+		next_tokens = next_tokens.masked_fill(finished, pad_id)
+		generated = torch.cat([generated, next_tokens.unsqueeze(1)], dim=1)
+		finished |= (next_tokens == eos_id)
+		if finished.all():
 			break
-
-		mask_ratio = 1.0 - ((step + 1) / max_iter)
-		num_mask = int((max_len - 1) * mask_ratio)
-		if num_mask <= 0:
-			break
-
-		valid_positions = (token_ids != bos_id) & (token_ids != pad_id)
-		valid_probs = max_probs.masked_fill(~valid_positions, float("inf"))
-		_, least_confident_indices = torch.topk(valid_probs, num_mask, dim=-1, largest=False)
-		token_ids.scatter_(1, least_confident_indices, mask_id)
 
 	output_batch: List[List[int]] = []
-	for row in token_ids.cpu().tolist():
+	for row in generated.cpu().tolist():
 		if eos_id in row:
 			row = row[: row.index(eos_id)]
 		output_batch.append(row)
@@ -165,13 +151,12 @@ def evaluate(args: argparse.Namespace) -> Tuple[float, float, int]:
 	tokenizer = Tokenizer.from_file(args.tokenizer)
 
 	pad_id = tokenizer.token_to_id("[PAD]")
-	mask_id = tokenizer.token_to_id("[MASK]")
 	bos_id = tokenizer.token_to_id("[BOS]")
 	eos_id = tokenizer.token_to_id("[EOS]")
-	if pad_id is None or mask_id is None or bos_id is None or eos_id is None:
-		raise RuntimeError("Tokenizer 缺少 [PAD]/[MASK]/[BOS]/[EOS]，无法进行 MLM 评估")
+	if pad_id is None or bos_id is None or eos_id is None:
+		raise RuntimeError("Tokenizer 缺少 [PAD]/[BOS]/[EOS]，无法进行 AR 评估")
 
-	dataset = MLMFormulaDataset(
+	dataset = FormulaDataset(
 		h5_path=args.eval_h5,
 		tokenizer_path=args.tokenizer,
 		max_area=args.max_area,
@@ -207,15 +192,13 @@ def evaluate(args: argparse.Namespace) -> Tuple[float, float, int]:
 		images = batch["images"].to(device)
 		target_ids = batch["target_ids"]
 
-		pred_batch = batched_infer_mlm_iterative(
+		pred_batch = batched_infer_ar(
 			model=model,
 			images=images,
 			pad_id=pad_id,
-			mask_id=mask_id,
 			bos_id=bos_id,
 			eos_id=eos_id,
 			max_len=args.max_len,
-			max_iter=args.max_iter,
 			amp_enabled=amp_enabled,
 		)
 
@@ -254,11 +237,11 @@ def evaluate(args: argparse.Namespace) -> Tuple[float, float, int]:
 
 	os.makedirs(args.report_dir, exist_ok=True)
 	ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-	report_path = os.path.join(args.report_dir, f"mlm_eval_report_{ts}.txt")
-	top_error_path = os.path.join(args.report_dir, f"mlm_eval_top_errors_{ts}.txt")
+	report_path = os.path.join(args.report_dir, f"ar_eval_report_{ts}.txt")
+	top_error_path = os.path.join(args.report_dir, f"ar_eval_top_errors_{ts}.txt")
 
 	with open(report_path, "w", encoding="utf-8") as f:
-		f.write("=== MLM Eval Report ===\n")
+		f.write("=== AR Eval Report ===\n")
 		f.write(f"checkpoint: {args.checkpoint}\n")
 		f.write(f"eval_h5: {args.eval_h5}\n")
 		f.write(f"EvalProcessed: {processed}\n")
@@ -267,7 +250,7 @@ def evaluate(args: argparse.Namespace) -> Tuple[float, float, int]:
 		f.write(f"EvalNED: {avg_ned:.6f}\n")
 		f.write(f"AvgED: {avg_ed:.4f}\n\n")
 
-		f.write("=== Top 20 Errors (same format as train_mlm) ===\n")
+		f.write("=== Top 20 Errors (same format as train) ===\n")
 		for err, cnt in mismatch_counter.most_common(20):
 			f.write(f"[{cnt:5d}] {err}\n")
 

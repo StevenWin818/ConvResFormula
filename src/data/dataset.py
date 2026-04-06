@@ -28,7 +28,7 @@ def calculate_dynamic_dims(h_orig: int, w_orig: int, max_area: int = 98304, min_
             
     return aligned_h, aligned_w
 
-class MLMFormulaDataset(Dataset):
+class FormulaDataset(Dataset):
     def __init__(self, h5_path: str, tokenizer_path: str, max_area: int = 98304, enable_augment: bool = False):
         """
         Args:

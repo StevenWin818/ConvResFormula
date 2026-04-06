@@ -1,4 +1,4 @@
-"""MLM 训练脚本入口。"""
+"""AR 训练脚本入口。"""
 
 import argparse
 import os
@@ -27,16 +27,16 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
 	sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.data.collate import MLMCollate
-from src.data.dataset import MLMFormulaDataset
+from src.data.collate import ARCollate
+from src.data.dataset import FormulaDataset
 from src.engine.lr_schedulers import build_linear_warmup_cosine_scheduler, infer_total_steps
-from src.engine.trainer import MLMTrainer
+from src.engine.trainer import ARTrainer
 from src.models.latex_ocr_model import LatexOCRModel
 
 
 def parse_args() -> argparse.Namespace:
 	bootstrap = argparse.ArgumentParser(add_help=False)
-	bootstrap.add_argument("--train-config", type=str, default=str(PROJECT_ROOT / "configs/train_mlm.yaml"))
+	bootstrap.add_argument("--train-config", type=str, default=str(PROJECT_ROOT / "configs/train_ar.yaml"))
 	bootstrap_args, _ = bootstrap.parse_known_args()
 
 	help_cfg: Dict[str, str] = {}
@@ -49,9 +49,9 @@ def parse_args() -> argparse.Namespace:
 	def h(key: str, fallback: str) -> str:
 		return help_cfg.get(key, fallback)
 
-	parser = argparse.ArgumentParser(description=h("description", "ConvNeXt-V2 + AttnRes 的 MLM 训练脚本"))
+	parser = argparse.ArgumentParser(description=h("description", "ConvNeXt-V2 + AttnRes 的 AR 训练脚本"))
 
-	parser.add_argument("--train-config", type=str, default=str(PROJECT_ROOT / "configs/train_mlm.yaml"), help=h("train_config", "训练配置文件路径"))
+	parser.add_argument("--train-config", type=str, default=str(PROJECT_ROOT / "configs/train_ar.yaml"), help=h("train_config", "训练配置文件路径"))
 	parser.add_argument("--model-config", type=str, default=str(PROJECT_ROOT / "configs/model_convnext_attnres.yaml"), help=h("model_config", "模型配置文件路径"))
 
 	parser.add_argument("--train_h5", type=str, nargs="+", default=None, help=h("train_h5", "训练集 H5 列表，可传多个文件"))
@@ -76,14 +76,12 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--warmup_start_lr", type=float, default=None, help=h("warmup_start_lr", "warmup 起始学习率"))
 	parser.add_argument("--eta_min", type=float, default=None, help=h("eta_min", "余弦退火最小学习率"))
 
-	parser.add_argument("--mask_prob", type=float, default=None, help=h("mask_prob", "MLM 掩码比例"))
 	parser.add_argument("--log_interval", type=int, default=None, help=h("log_interval", "训练日志打印间隔(step)"))
 	parser.add_argument("--eval_interval", type=int, default=None, help=h("eval_interval", "每隔多少个 epoch 评估一次"))
 	parser.add_argument("--eval_batch_size", type=int, default=None, help=h("eval_batch_size", "评估批大小"))
 	parser.add_argument("--eval_num_workers", type=int, default=None, help=h("eval_num_workers", "评估 DataLoader 线程数"))
 	parser.add_argument("--eval_samples", type=int, default=None, help=h("eval_samples", "每轮评估抽样数量，<=0 表示全量"))
 	parser.add_argument("--eval_max_len", type=int, default=None, help=h("eval_max_len", "评估解码最大长度"))
-	parser.add_argument("--eval_max_iter", type=int, default=None, help=h("eval_max_iter", "评估迭代解码步数"))
 	parser.add_argument("--amp_dtype", type=str, choices=["fp16", "bf16", "fp32"], default=None, help=h("amp_dtype", "训练精度类型: fp16 / bf16 / fp32"))
 
 	eval_group = parser.add_mutually_exclusive_group()
@@ -152,15 +150,6 @@ def apply_config_defaults(args: argparse.Namespace, train_cfg: Dict[str, Any], m
 	args.warmup_start_lr = args.warmup_start_lr if args.warmup_start_lr is not None else float(_cfg_get(train_cfg, ("scheduler", "warmup_start_lr"), 1e-7))
 	args.eta_min = args.eta_min if args.eta_min is not None else float(_cfg_get(train_cfg, ("scheduler", "eta_min"), 1e-6))
 
-	args.mask_prob = args.mask_prob if args.mask_prob is not None else float(_cfg_get(train_cfg, ("mlm", "mask_prob"), 0.15))
-	args.dynamic_mask_prob = bool(_cfg_get(train_cfg, ("mlm", "dynamic_mask_prob"), False))  # 是否启用动态掩码比例
-	args.dynamic_mask_min = float(_cfg_get(train_cfg, ("mlm", "dynamic_mask_min"), 0.1))
-	args.dynamic_mask_max = float(_cfg_get(train_cfg, ("mlm", "dynamic_mask_max"), 1.0))
-	if args.dynamic_mask_min > args.dynamic_mask_max:
-		raise ValueError(
-			f"mlm.dynamic_mask_min 不能大于 mlm.dynamic_mask_max，当前为 {args.dynamic_mask_min}>{args.dynamic_mask_max}"
-		)
-
 	args.label_smoothing = float(_cfg_get(train_cfg, ("optimization", "label_smoothing"), 0.1))
 
 	args.log_interval = args.log_interval if args.log_interval is not None else int(_cfg_get(train_cfg, ("logging", "log_interval"), 20))
@@ -169,8 +158,6 @@ def apply_config_defaults(args: argparse.Namespace, train_cfg: Dict[str, Any], m
 	args.eval_num_workers = args.eval_num_workers if args.eval_num_workers is not None else int(_cfg_get(train_cfg, ("eval", "num_workers"), 2))
 	args.eval_samples = args.eval_samples if args.eval_samples is not None else int(_cfg_get(train_cfg, ("eval", "samples"), 1500))
 	args.eval_max_len = args.eval_max_len if args.eval_max_len is not None else int(_cfg_get(train_cfg, ("eval", "max_len"), 160))
-	args.eval_max_iter = args.eval_max_iter if args.eval_max_iter is not None else int(_cfg_get(train_cfg, ("eval", "max_iter"), 4))
-
 	if args.skip_eval is None:
 		args.skip_eval = bool(_cfg_get(train_cfg, ("eval", "skip_eval"), False))
 
@@ -178,9 +165,9 @@ def apply_config_defaults(args: argparse.Namespace, train_cfg: Dict[str, Any], m
 	if args.amp_dtype not in {"fp16", "bf16", "fp32"}:
 		raise ValueError(f"amp_dtype 必须是 fp16/bf16/fp32，当前为: {args.amp_dtype}")
 
-	args.ckpt_dir = args.ckpt_dir or str(_cfg_get(train_cfg, ("runtime", "ckpt_dir"), r"checkpoints\mlm"))
-	args.log_dir = args.log_dir or str(_cfg_get(train_cfg, ("runtime", "log_dir"), r"logs\mlm_logs"))
-	args.resume_ckpt = args.resume_ckpt or str(_cfg_get(train_cfg, ("runtime", "resume_ckpt"), r"checkpoints\mlm\latest.pth"))
+	args.ckpt_dir = args.ckpt_dir or str(_cfg_get(train_cfg, ("runtime", "ckpt_dir"), r"checkpoints\ar"))
+	args.log_dir = args.log_dir or str(_cfg_get(train_cfg, ("runtime", "log_dir"), r"logs\ar_logs"))
+	args.resume_ckpt = args.resume_ckpt or str(_cfg_get(train_cfg, ("runtime", "resume_ckpt"), r"checkpoints\ar\latest.pth"))
 	args.cudnn_benchmark = bool(_cfg_get(train_cfg, ("runtime", "cudnn_benchmark"), True))
 	args.kernel_warmup_batches = int(_cfg_get(train_cfg, ("runtime", "kernel_warmup_batches"), 8))
     
@@ -191,11 +178,11 @@ def apply_config_defaults(args: argparse.Namespace, train_cfg: Dict[str, Any], m
 		args.resume = bool(_cfg_get(train_cfg, ("runtime", "resume"), False))
 
 	if not args.tokenizer:
-		raise RuntimeError("配置缺少 tokenizer 路径，请在 train_mlm.yaml:data.tokenizer 中设置")
+		raise RuntimeError("配置缺少 tokenizer 路径，请在 train_ar.yaml:data.tokenizer 中设置")
 	if not args.train_h5:
-		raise RuntimeError("配置缺少 train_h5 列表，请在 train_mlm.yaml:data.train_h5 中设置")
+		raise RuntimeError("配置缺少 train_h5 列表，请在 train_ar.yaml:data.train_h5 中设置")
 	if (not args.skip_eval) and (not args.eval_h5):
-		raise RuntimeError("启用了评估但缺少 eval_h5，请在 train_mlm.yaml:data.eval_h5 中设置")
+		raise RuntimeError("启用了评估但缺少 eval_h5，请在 train_ar.yaml:data.eval_h5 中设置")
 
 
 def set_seed(seed: int) -> None:
@@ -429,57 +416,43 @@ def levenshtein_distance(s1: str, s2: str) -> int:
 
 
 @torch.no_grad()
-def batched_infer_mlm_iterative(
+def batched_infer_ar(
 	model: LatexOCRModel,
 	images: torch.Tensor,
 	pad_id: int,
-	mask_id: int,
 	bos_id: int,
 	eos_id: int,
 	max_len: int,
-	max_iter: int,
 	amp_enabled: bool,
 	amp_dtype: torch.dtype,
 ) -> List[List[int]]:
-	"""批量版 Mask-Predict 解码，用于加速训练期评估。"""
+	"""批量版 AR 贪心解码，用于加速训练期评估。"""
 	batch_size = images.size(0)
 	device = images.device
-
-	token_ids = torch.full((batch_size, max_len), pad_id, dtype=torch.long, device=device)
-	token_ids[:, 0] = bos_id
-	if max_len > 1:
-		token_ids[:, 1:] = mask_id
 
 	# 视觉特征在一次迭代解码中不变，仅提取一次并复用
 	with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
 		memory = model.encode(images)
 
-	for step in range(max_iter):
+	downsampled_mask = torch.nn.functional.max_pool2d(images, kernel_size=32, stride=32)
+	memory_padding_mask = (downsampled_mask.view(batch_size, -1) <= 1e-5)
+
+	generated = torch.full((batch_size, 1), bos_id, dtype=torch.long, device=device)
+	finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+	for _ in range(max_len - 1):
 		with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-			logits = model.decode(memory=memory, tgt_seq=token_ids, is_causal=False)
+			logits = model.decode(memory=memory, tgt_seq=generated, memory_padding_mask=memory_padding_mask, is_causal=True)
 
-		probs = torch.softmax(logits, dim=-1)
-		max_probs, preds = torch.max(probs, dim=-1)
-
-		is_mask = token_ids == mask_id
-		token_ids[is_mask] = preds[is_mask]
-
-		if step == max_iter - 1:
+		next_tokens = logits[:, -1, :].argmax(dim=-1)
+		next_tokens = next_tokens.masked_fill(finished, pad_id)
+		generated = torch.cat([generated, next_tokens.unsqueeze(1)], dim=1)
+		finished |= (next_tokens == eos_id)
+		if finished.all():
 			break
-
-		mask_ratio = 1.0 - ((step + 1) / max_iter)
-		num_mask = int((max_len - 1) * mask_ratio)
-		if num_mask <= 0:
-			break
-
-		# 🚀 修复：将 eos_id 也加入保护圈！一旦模型确定这里是结束或填充，就不再二次 MASK
-		valid_positions = (token_ids != bos_id) & (token_ids != pad_id) & (token_ids != eos_id)
-		valid_probs = max_probs.masked_fill(~valid_positions, float("inf"))
-		_, least_confident_indices = torch.topk(valid_probs, num_mask, dim=-1, largest=False)
-		token_ids.scatter_(1, least_confident_indices, mask_id)
 
 	output_batch: List[List[int]] = []
-	for row in token_ids.cpu().tolist():
+	for row in generated.cpu().tolist():
 		if eos_id in row:
 			row = row[: row.index(eos_id)]
 		output_batch.append(row)
@@ -496,12 +469,10 @@ def evaluate_epoch(
 	amp_enabled: bool,
 	amp_dtype: torch.dtype,
 	pad_id: int,
-	mask_id: int,
 	bos_id: int,
 	eos_id: int,
 	num_samples: int,
 	max_len: int,
-	max_iter: int,
 ) -> Tuple[float, Counter[str], Dict[str, float]]:
 	"""参考 train_2d_phase2 的评估流程：按 epoch 抽样评估 + Top 错误统计。"""
 	model.eval()
@@ -519,15 +490,13 @@ def evaluate_epoch(
 		images = batch["images"].to(device)
 		target_ids = batch["target_ids"]
 
-		pred_batch = batched_infer_mlm_iterative(
+		pred_batch = batched_infer_ar(
 			model=model,
 			images=images,
 			pad_id=pad_id,
-			mask_id=mask_id,
 			bos_id=bos_id,
 			eos_id=eos_id,
 			max_len=max_len,
-			max_iter=max_iter,
 			amp_enabled=amp_enabled,
 			amp_dtype=amp_dtype,
 		)
@@ -590,10 +559,10 @@ def warmup_kernel_cache(
 				break
 
 			images = batch["images"].to(device, non_blocking=True)
-			masked_token_ids = batch["masked_token_ids"].to(device, non_blocking=True)
+			clean_token_ids = batch["clean_token_ids"].to(device, non_blocking=True)
 
 			with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-				_ = model(images=images, tgt_seq=masked_token_ids, is_causal=False)
+				_ = model(images=images, tgt_seq=clean_token_ids[:, :-1], is_causal=True)
 
 			steps += 1
 
@@ -616,7 +585,7 @@ def main() -> None:
 
 	os.makedirs(args.ckpt_dir, exist_ok=True)
 	os.makedirs(args.log_dir, exist_ok=True)
-	log_path = os.path.join(args.log_dir, "train_mlm.log")
+	log_path = os.path.join(args.log_dir, "train_ar.log")
 
 	device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 	amp_dtype_map: Dict[str, torch.dtype] = {
@@ -639,24 +608,20 @@ def main() -> None:
 	vocab_size = tokenizer.get_vocab_size()
 
 	pad_id = tokenizer.token_to_id("[PAD]")
-	mask_id = tokenizer.token_to_id("[MASK]")
 	bos_id = tokenizer.token_to_id("[BOS]")
 	eos_id = tokenizer.token_to_id("[EOS]")
-	unk_id = tokenizer.token_to_id("[UNK]")
 
-	if pad_id is None or mask_id is None:
-		raise RuntimeError("Tokenizer 缺少 [PAD] 或 [MASK]，无法进行 MLM 训练")
+	if pad_id is None:
+		raise RuntimeError("Tokenizer 缺少 [PAD]，无法进行 AR 训练")
 	if bos_id is None or eos_id is None:
-		raise RuntimeError("Tokenizer 缺少 [BOS] 或 [EOS]，无法进行迭代评估解码")
-
-	special_token_ids = [idx for idx in [pad_id, mask_id, bos_id, eos_id, unk_id] if idx is not None]
+		raise RuntimeError("Tokenizer 缺少 [BOS] 或 [EOS]，无法进行 AR 评估解码")
 
 	dataset_paths = [p for p in args.train_h5 if os.path.exists(p)]
 	if not dataset_paths:
 		raise FileNotFoundError(f"训练集不存在，请检查路径: {args.train_h5}")
 
 	datasets = [
-		MLMFormulaDataset(h5_path=path, tokenizer_path=args.tokenizer, max_area=args.max_area, enable_augment=True)
+		FormulaDataset(h5_path=path, tokenizer_path=args.tokenizer, max_area=args.max_area, enable_augment=True)
 		for path in dataset_paths
 	]
 	train_dataset = datasets[0] if len(datasets) == 1 else ConcatDataset(datasets)
@@ -696,16 +661,8 @@ def main() -> None:
 		drop_last=True,
 	)
 
-	collate_fn = MLMCollate(
+	collate_fn = ARCollate(
 		pad_token_id=pad_id,
-		mask_token_id=mask_id,
-		vocab_size=vocab_size,
-		special_token_ids=special_token_ids,
-		bos_token_id=bos_id,
-		mask_prob=args.mask_prob,
-		dynamic_mask_prob=args.dynamic_mask_prob,
-		dynamic_mask_min=args.dynamic_mask_min,
-		dynamic_mask_max=args.dynamic_mask_max,
 	)
 
 	train_loader = DataLoader(
@@ -722,7 +679,7 @@ def main() -> None:
 		if not os.path.exists(args.eval_h5):
 			raise FileNotFoundError(f"评估集不存在: {args.eval_h5}")
 
-		eval_dataset = MLMFormulaDataset(
+		eval_dataset = FormulaDataset(
 			h5_path=args.eval_h5,
 			tokenizer_path=args.tokenizer,
 			max_area=args.max_area,
@@ -756,7 +713,7 @@ def main() -> None:
 	)
 
 	scaler = torch.cuda.amp.GradScaler(enabled=True) if (device.type == "cuda" and args.amp_dtype == "fp16") else None
-	trainer = MLMTrainer(
+	trainer = ARTrainer(
 		model=model,
 		optimizer=optimizer,
 		scheduler=scheduler,
@@ -786,12 +743,12 @@ def main() -> None:
 
 	if not os.path.exists(log_path):
 		with open(log_path, "w", encoding="utf-8") as f:
-			f.write("Timestamp\tEpoch\tLoss\tMaskAcc(%)\tEvalProcessed\tEvalExact\tEvalEM(%)\tEvalNED\tLREnc\tLRDec\n")
+			f.write("Timestamp\tEpoch\tLoss\tTokenAcc(%)\tEvalProcessed\tEvalExact\tEvalEM(%)\tEvalNED\tLREnc\tLRDec\n")
 
 	print("=" * 80)
 	print(
-		f"MLM 训练启动 | Device={device} | AMP={amp_enabled} | AMP_DTYPE={args.amp_dtype} | "
-		f"MaskProb={args.mask_prob} | DynamicMask={args.dynamic_mask_prob} | LabelSmoothing={args.label_smoothing}"
+		f"AR 训练启动 | Device={device} | AMP={amp_enabled} | AMP_DTYPE={args.amp_dtype} | "
+		f"LabelSmoothing={args.label_smoothing}"
 	)
 	print(f"TrainConfig={args.train_config}")
 	print(f"ModelConfig={args.model_config}")
@@ -838,12 +795,10 @@ def main() -> None:
 				amp_enabled=amp_enabled,
 				amp_dtype=amp_dtype,
 				pad_id=pad_id,
-				mask_id=mask_id,
 				bos_id=bos_id,
 				eos_id=eos_id,
 				num_samples=args.eval_samples,
 				max_len=args.eval_max_len,
-				max_iter=args.eval_max_iter,
 			)
 			eval_processed = eval_stats["processed"]
 			eval_exact = eval_stats["exact"]
@@ -854,7 +809,7 @@ def main() -> None:
 
 		print(
 			f"Epoch {epoch}/{args.epochs} | "
-			f"Loss={avg_loss:.4f} | MaskAcc={avg_acc * 100:.2f}% | "
+			f"Loss={avg_loss:.4f} | TokenAcc={avg_acc * 100:.2f}% | "
 			f"EvalEM={eval_em * 100:.2f}% | EvalNED={eval_ned:.4f} | "
 			f"LRE={lr_enc:.2e} | LRD={lr_dec:.2e}"
 		)
@@ -891,7 +846,7 @@ def main() -> None:
 		torch.save(ckpt_payload, epoch_ckpt)
 
 		if error_counter:
-			err_path = os.path.join(args.log_dir, f"mlm_epoch_{epoch}_top_errors.txt")
+			err_path = os.path.join(args.log_dir, f"ar_epoch_{epoch}_top_errors.txt")
 			with open(err_path, "w", encoding="utf-8") as ef:
 				for key, count in error_counter.most_common(20):
 					ef.write(f"[{count:5d}] {key}\n")
@@ -907,7 +862,7 @@ def main() -> None:
 			ckpt_payload["best_loss"] = best_loss
 			print(f"更新最小训练损失: {best_loss:.4f}")
 
-	print("\nMLM 训练完成。")
+	print("\nAR 训练完成。")
 
 
 if __name__ == "__main__":

@@ -78,43 +78,44 @@ class LatexOCRModel(nn.Module):
         return mask
 
     def encode(self, images: torch.Tensor) -> torch.Tensor:
-        """推理/评估专用：提取图像特征，供后续迭代解码复用。"""
+        """只运行一次视觉骨干网络"""
         return self.encoder(images)
 
-    def decode(self, memory: torch.Tensor, tgt_seq: torch.Tensor, is_causal: bool = False) -> torch.Tensor:
-        """推理/评估专用：基于缓存的视觉特征执行文本解码。"""
-        # 文本 padding 掩码 (告诉模型哪些是 [PAD]，不要将注意力放在上面)
+    def decode(
+        self,
+        memory: torch.Tensor,
+        tgt_seq: torch.Tensor,
+        memory_padding_mask: Optional[torch.Tensor] = None,
+        is_causal: bool = True,
+    ) -> torch.Tensor:
+        """自回归循环运行的大脑"""
         tgt_key_padding_mask = (tgt_seq == self.pad_id)
-
-        # Token Embedding + Positional Encoding
         tgt_emb = self.text_embedding(tgt_seq) * math.sqrt(self.d_model)
         tgt_emb = self.text_pos_enc(tgt_emb)
 
-        # 动态掩码生成
         seq_len = tgt_seq.size(1)
         tgt_mask = self.generate_causal_mask(seq_len, tgt_seq.device) if is_causal else None
 
-        # --- 解码阶段 ---
         decoder_out = self.decoder(
             text_embeddings=tgt_emb,
             cross_features=memory,
             tgt_mask=tgt_mask,
             tgt_key_padding_mask=tgt_key_padding_mask,
-            memory_key_padding_mask=None # 视觉侧通常不用 padding mask
+            memory_key_padding_mask=memory_padding_mask,
         )
-
-        # --- 分类预测 ---
-        return self.head(decoder_out)
+        logits = self.head(decoder_out)
+        return logits
 
     def forward(self, images: torch.Tensor, tgt_seq: torch.Tensor, is_causal: bool = True) -> torch.Tensor:
-        """
-        前向传播 (支持双分支模式)
-        Args:
-            images: [Batch, 1, H, W] 图像张量
-            tgt_seq: [Batch, SeqLen] 输入给 Decoder 的文本 ID 
-            is_causal: True 为标准 AR 模式(下三角掩码)，False 为 MLM 模式(无掩码，允许双向互看)
-        Returns:
-            logits: [Batch, SeqLen, vocab_size]
-        """
+        """训练时使用的完整前向传播"""
+        import torch.nn.functional as F
+
         memory = self.encode(images)
-        return self.decode(memory=memory, tgt_seq=tgt_seq, is_causal=is_causal)
+        batch_size = memory.size(0)
+
+        # 通过池化近似估计视觉 token 的无效填充区域
+        with torch.no_grad():
+            downsampled_mask = F.max_pool2d(images, kernel_size=32, stride=32)
+            memory_padding_mask = (downsampled_mask.view(batch_size, -1) <= 1e-5)
+
+        return self.decode(memory, tgt_seq, memory_padding_mask, is_causal)

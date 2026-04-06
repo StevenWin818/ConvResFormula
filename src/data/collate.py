@@ -195,4 +195,100 @@ class MLMCollate:
             # 保持向后兼容，旧训练器仍可读取 labels
             "labels": mlm_labels,
         }
+
+
+class ARCollate:
+    """纯 AR 训练用的动态 batch 组装，不做任何 MLM 掩码。"""
+
+    def __init__(
+        self,
+        pad_token_id,
+        shape_quant_size=64,
+        max_seq_len=256,
+        area_limit=98304 * 1.5,
+    ):
+        self.pad_token_id = int(pad_token_id)
+        self.shape_quant_size = int(shape_quant_size)
+        self.max_seq_len = int(max_seq_len)
+        self.area_limit = float(area_limit)
+
+        if self.shape_quant_size <= 0:
+            raise ValueError(f"shape_quant_size 必须 > 0，当前为 {self.shape_quant_size}")
+        if self.max_seq_len <= 0:
+            raise ValueError(f"max_seq_len 必须 > 0，当前为 {self.max_seq_len}")
+        if self.area_limit <= 0:
+            raise ValueError(f"area_limit 必须 > 0，当前为 {self.area_limit}")
+
+    def __call__(self, batch):
+        images = []
+        input_ids_list = []
+
+        for item in batch:
+            images.append(item["image"])
+
+            seq = item["input_ids"]
+            if not isinstance(seq, torch.Tensor):
+                seq = torch.tensor(seq, dtype=torch.long)
+
+            if seq.numel() > self.max_seq_len:
+                seq = seq[: self.max_seq_len]
+
+            input_ids_list.append(seq)
+
+        if len(images) > 0 and isinstance(images[0], torch.Tensor):
+            max_h = max(int(img.shape[1]) for img in images)
+            max_w = max(int(img.shape[2]) for img in images)
+
+            q = self.shape_quant_size
+            max_h = ((max_h + q - 1) // q) * q
+            max_w = ((max_w + q - 1) // q) * q
+
+            area_limit = int(self.area_limit)
+            if max_h * max_w > area_limit:
+                scale = math.sqrt(area_limit / float(max_h * max_w))
+                target_h = max(q, ((int(max_h * scale) + q - 1) // q) * q)
+                target_w = max(q, ((int(max_w * scale) + q - 1) // q) * q)
+
+                resized_images = []
+                for img in images:
+                    _, h, w = img.shape
+                    h_int = int(h)
+                    w_int = int(w)
+                    if h_int > target_h or w_int > target_w:
+                        scale_hw = min(target_h / max(h_int, 1), target_w / max(w_int, 1))
+                        new_h = max(q, ((int(h_int * scale_hw) + q - 1) // q) * q)
+                        new_w = max(q, ((int(w_int * scale_hw) + q - 1) // q) * q)
+                        new_h = min(new_h, target_h)
+                        new_w = min(new_w, target_w)
+                        img = F.interpolate(
+                            img.unsqueeze(0),
+                            size=(new_h, new_w),
+                            mode="bilinear",
+                            align_corners=False,
+                        ).squeeze(0)
+                    resized_images.append(img)
+
+                images = resized_images
+                max_h = max(int(img.shape[1]) for img in images)
+                max_w = max(int(img.shape[2]) for img in images)
+                max_h = ((max_h + q - 1) // q) * q
+                max_w = ((max_w + q - 1) // q) * q
+
+            batch_size = len(images)
+            batched_images = torch.zeros((batch_size, 1, max_h, max_w), dtype=torch.float32)
+
+            for i, img in enumerate(images):
+                _, h, w = img.shape
+                batched_images[i, :, :h, :w] = img
+
+            images = batched_images
+
+        clean_token_ids = pad_sequence(input_ids_list, batch_first=True, padding_value=self.pad_token_id)
+
+        return {
+            "images": images,
+            "clean_token_ids": clean_token_ids,
+            # 为兼容旧逻辑保留 labels，同 clean_token_ids
+            "labels": clean_token_ids,
+        }
      

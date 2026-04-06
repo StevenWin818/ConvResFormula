@@ -1,13 +1,13 @@
 """
 src/engine/trainer.py
-训练循环、AMP、优化器控制与 MLM 专属监控。
+训练循环、AMP 与优化器控制（AR）。
 """
 import torch
 import torch.nn as nn
+import math
 from tqdm import tqdm
-from typing import Tuple
 
-class MLMTrainer:
+class ARTrainer:
     def __init__(
         self,
         model,
@@ -41,16 +41,8 @@ class MLMTrainer:
         if not (0.0 <= self.label_smoothing < 1.0):
             raise ValueError(f"label_smoothing 必须在 [0,1) 区间，当前为 {self.label_smoothing}")
         
-        # ignore_index=-100 自动忽略不需要预测的 Token
-        self.criterion = nn.CrossEntropyLoss(ignore_index=-100, label_smoothing=self.label_smoothing)
-
-    def _train_step_single(self, images, masked_token_ids, labels) -> Tuple[torch.Tensor, torch.Tensor]:
-        with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.amp_enabled):
-            logits = self.model(images=images, tgt_seq=masked_token_ids, is_causal=False)
-            logits_flat = logits.view(-1, logits.size(-1))
-            labels_flat = labels.view(-1)
-            loss = self.criterion(logits_flat, labels_flat)
-        return loss, logits
+        self.pad_id = int(getattr(model, "pad_id", 0))
+        self.criterion = nn.CrossEntropyLoss(ignore_index=self.pad_id, label_smoothing=self.label_smoothing)
 
     def _optimizer_step(self) -> None:
         if self.scaler is not None:
@@ -62,18 +54,6 @@ class MLMTrainer:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
 
-    def _calculate_masked_accuracy(self, logits, labels):
-        """计算掩码位置的预测准确率"""
-        preds = torch.argmax(logits, dim=-1)
-        # 找出真正被 Mask 或替换，且需要预测的位置 (label != -100)
-        mask = labels != -100
-        if mask.sum() == 0:
-            return 0.0
-        
-        correct = (preds[mask] == labels[mask]).float().sum()
-        total = mask.sum().float()
-        return (correct / total).item()
-
     def train_epoch(self, dataloader, epoch, log_interval=50):
         self.model.train()
         total_loss = 0.0
@@ -81,37 +61,68 @@ class MLMTrainer:
         
         pbar = tqdm(dataloader, desc=f"Epoch {epoch} [Train]")
         for batch_idx, batch in enumerate(pbar):
-            # 1. 数据迁移到训练设备
             images = batch["images"].to(self.device, non_blocking=True)
-            masked_token_ids = batch["masked_token_ids"].to(self.device, non_blocking=True)
-            labels = batch.get("mlm_labels", batch["labels"]).to(self.device, non_blocking=True)
-            
-            self.optimizer.zero_grad(set_to_none=True)
+            clean_token_ids = batch["clean_token_ids"].to(self.device, non_blocking=True)
 
-            loss, logits = self._train_step_single(images, masked_token_ids, labels)
+            # AR Teacher Forcing：输入去掉最后一个 token，目标右移一位
+            ar_inputs = clean_token_ids[:, :-1]
+            ar_targets = clean_token_ids[:, 1:].contiguous()
 
-            if self.scaler is not None:
-                self.scaler.scale(loss).backward()
-            else:
-                loss.backward()
+            batch_size = images.size(0)
+            success = False
+            chunks = 1
 
-            self._optimizer_step()
-            self.scheduler.step()
+            while (not success) and chunks <= batch_size:
+                try:
+                    self.optimizer.zero_grad(set_to_none=True)
+                    chunk_size = math.ceil(batch_size / chunks)
+                    batch_loss_sum = 0.0
+                    batch_acc_sum = 0.0
 
-            loss_val = float(loss.item())
-            acc = self._calculate_masked_accuracy(logits, labels)
+                    for i in range(0, batch_size, chunk_size):
+                        img_chunk = images[i : i + chunk_size]
+                        ar_in_chunk = ar_inputs[i : i + chunk_size]
+                        ar_tgt_chunk = ar_targets[i : i + chunk_size]
 
-            # 4. 统计与日志记录
-            total_loss += loss_val
-            total_acc += acc
+                        with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.amp_enabled):
+                            logits = self.model(images=img_chunk, tgt_seq=ar_in_chunk, is_causal=True)
+                            loss = self.criterion(logits.view(-1, logits.size(-1)), ar_tgt_chunk.view(-1)) / chunks
+
+                        if self.scaler is not None:
+                            self.scaler.scale(loss).backward()
+                        else:
+                            loss.backward()
+
+                        preds = logits.argmax(dim=-1)
+                        valid_mask = ar_tgt_chunk != self.pad_id
+                        if valid_mask.any():
+                            chunk_acc = (preds[valid_mask] == ar_tgt_chunk[valid_mask]).float().mean().item()
+                        else:
+                            chunk_acc = 0.0
+
+                        batch_loss_sum += loss.item() * chunks
+                        batch_acc_sum += chunk_acc * (img_chunk.size(0) / batch_size)
+
+                    self._optimizer_step()
+                    self.scheduler.step()
+                    success = True
+
+                except torch.cuda.OutOfMemoryError:
+                    if 'logits' in locals():
+                        del logits
+                    if 'loss' in locals():
+                        del loss
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    chunks *= 2
+
+            if not success:
+                continue
+
+            total_loss += batch_loss_sum
+            total_acc += batch_acc_sum
             
             if batch_idx % log_interval == 0:
-                current_lr = self.scheduler.get_last_lr()[0]
-                postfix = {
-                    "loss": f"{loss_val:.4f}",
-                    "mask_acc": f"{acc*100:.2f}%",
-                    "lr": f"{current_lr:.2e}",
-                }
-                pbar.set_postfix(postfix)
+                pbar.set_postfix({"Loss": f"{batch_loss_sum:.3f}", "Acc": f"{batch_acc_sum*100:.1f}%"})
                 
         return total_loss / len(dataloader), total_acc / len(dataloader)
