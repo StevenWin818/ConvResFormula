@@ -472,7 +472,8 @@ def batched_infer_mlm_iterative(
 		if num_mask <= 0:
 			break
 
-		valid_positions = (token_ids != bos_id) & (token_ids != pad_id)
+		# 🚀 修复：将 eos_id 也加入保护圈！一旦模型确定这里是结束或填充，就不再二次 MASK
+		valid_positions = (token_ids != bos_id) & (token_ids != pad_id) & (token_ids != eos_id)
 		valid_probs = max_probs.masked_fill(~valid_positions, float("inf"))
 		_, least_confident_indices = torch.topk(valid_probs, num_mask, dim=-1, largest=False)
 		token_ids.scatter_(1, least_confident_indices, mask_id)
@@ -609,6 +610,10 @@ def main() -> None:
 	apply_config_defaults(args, train_cfg, model_cfg)
 	set_seed(args.seed)
 
+	# 强制关闭动态形状下的底层重编译/寻优抖动
+	torch.backends.cudnn.benchmark = False
+	torch.backends.cudnn.deterministic = True
+
 	os.makedirs(args.ckpt_dir, exist_ok=True)
 	os.makedirs(args.log_dir, exist_ok=True)
 	log_path = os.path.join(args.log_dir, "train_mlm.log")
@@ -627,7 +632,8 @@ def main() -> None:
 		amp_enabled = False
 
 	if device.type == "cuda":
-		torch.backends.cudnn.benchmark = bool(args.cudnn_benchmark)
+		torch.backends.cudnn.benchmark = False
+		torch.backends.cudnn.deterministic = True
 
 	tokenizer = Tokenizer.from_file(args.tokenizer)
 	vocab_size = tokenizer.get_vocab_size()
@@ -695,6 +701,7 @@ def main() -> None:
 		mask_token_id=mask_id,
 		vocab_size=vocab_size,
 		special_token_ids=special_token_ids,
+		bos_token_id=bos_id,
 		mask_prob=args.mask_prob,
 		dynamic_mask_prob=args.dynamic_mask_prob,
 		dynamic_mask_min=args.dynamic_mask_min,
@@ -790,7 +797,11 @@ def main() -> None:
 	print(f"ModelConfig={args.model_config}")
 	print(f"Datasets={dataset_paths}")
 	print(f"MixRatio={args.mix_ratio} | EpochSamples={train_batch_sampler.sample_count} | TrainBatches={len(train_batch_sampler)}")
-	print(f"cudnn.benchmark={torch.backends.cudnn.benchmark} | KernelWarmupBatches={args.kernel_warmup_batches}")
+	print(
+		f"cudnn.benchmark={torch.backends.cudnn.benchmark} | "
+		f"cudnn.deterministic={torch.backends.cudnn.deterministic} | "
+		f"KernelWarmupBatches={args.kernel_warmup_batches}"
+	)
 	if not args.skip_eval:
 		print(f"EvalSet={args.eval_h5} | EvalBatch={args.eval_batch_size} | EvalSamples={args.eval_samples}")
 	print(f"Total Steps={total_steps}, Warmup Steps={warmup_steps}")

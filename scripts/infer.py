@@ -43,7 +43,8 @@ def infer_mlm_iterative(model, image, tokenizer, max_len=256, max_iter=5, device
                 break
                 
             # 3. 寻找置信度最低的位置并重掩盖
-            valid_positions = (token_ids != bos_id) & (token_ids != pad_id)
+            # 🚀 修复：将 eos_id 也加入保护圈！一旦模型确定这里是结束或填充，就不再二次 MASK
+            valid_positions = (token_ids != bos_id) & (token_ids != pad_id) & (token_ids != eos_id)
             # 将不应被掩盖的位置置信度设为无穷大
             valid_probs = max_probs.masked_fill(~valid_positions, float('inf'))
             
