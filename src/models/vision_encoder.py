@@ -4,7 +4,7 @@ ConvNeXt-V2 视觉编码器接口。
 """
 
 import math
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -86,14 +86,17 @@ class ConvNeXtV2Encoder(nn.Module):
         # 注意：这里的 max_h 和 max_w 是指“特征图”的最大尺寸。
         self.pos_encoder = PositionalEncoding2D(d_model=d_model, max_h=128, max_w=1024)
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             x: [Batch, 1, H, W] 归一化后的图像张量
             mask: (可选) 目前不需要，保持接口兼容
         Returns:
             features: [Batch, Seq_Len, d_model] 给 Decoder 用的序列
+            memory_padding_mask: [Batch, Seq_Len] 布尔掩码 (True 表示该位置是纯黑 Padding)
         """
+        import torch.nn.functional as F
+
         # 1. 骨干网络提取二维特征图
         # 输出尺寸: [Batch, C, H_feat, W_feat]
         backbone_output: Any = self.backbone(x)
@@ -105,9 +108,14 @@ class ConvNeXtV2Encoder(nn.Module):
         # 3. 注入二维物理绝对位置信息
         features = self.pos_encoder(features)
         
-        # 4. 展平为 1D 序列 (从 2D 图变为文字序列一样的排布)
-        # [Batch, d_model, H_feat, W_feat] -> [Batch, d_model, H_feat * W_feat] -> [Batch, Seq_Len, d_model]
+        # 4. 构造视觉 memory 的 padding mask
         b, c, h_feat, w_feat = features.size()
+        with torch.no_grad():
+            downsampled_mask = F.max_pool2d(x, kernel_size=32, stride=32)
+            memory_padding_mask = (downsampled_mask.view(b, -1) <= 1e-5)
+
+        # 5. 展平为 1D 序列 (从 2D 图变为文字序列一样的排布)
+        # [Batch, d_model, H_feat, W_feat] -> [Batch, d_model, H_feat * W_feat] -> [Batch, Seq_Len, d_model]
         features = features.flatten(2).permute(0, 2, 1)
         
-        return features
+        return features, memory_padding_mask

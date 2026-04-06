@@ -432,10 +432,7 @@ def batched_infer_ar(
 
 	# 视觉特征在一次迭代解码中不变，仅提取一次并复用
 	with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-		memory = model.encode(images)
-
-	downsampled_mask = torch.nn.functional.max_pool2d(images, kernel_size=32, stride=32)
-	memory_padding_mask = (downsampled_mask.view(batch_size, -1) <= 1e-5)
+		memory, memory_padding_mask = model.encode(images)
 
 	generated = torch.full((batch_size, 1), bos_id, dtype=torch.long, device=device)
 	finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
@@ -599,10 +596,6 @@ def main() -> None:
 		print("警告: 当前为 CPU 设备，已自动降级为 fp32 训练。")
 		amp_dtype = torch.float32
 		amp_enabled = False
-
-	if device.type == "cuda":
-		torch.backends.cudnn.benchmark = False
-		torch.backends.cudnn.deterministic = True
 
 	tokenizer = Tokenizer.from_file(args.tokenizer)
 	vocab_size = tokenizer.get_vocab_size()

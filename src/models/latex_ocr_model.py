@@ -4,7 +4,7 @@ LaTeX OCR 主模型组装与 MLM 前向接口。
 import math
 import torch
 import torch.nn as nn
-from typing import Optional
+from typing import Optional, Tuple
 
 from .vision_encoder import ConvNeXtV2Encoder
 from .text_decoder import AttnResTextDecoder
@@ -77,8 +77,8 @@ class LatexOCRModel(nn.Module):
         mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
         return mask
 
-    def encode(self, images: torch.Tensor) -> torch.Tensor:
-        """只运行一次视觉骨干网络"""
+    def encode(self, images: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """返回特征序列和 Padding 掩码"""
         return self.encoder(images)
 
     def decode(
@@ -108,14 +108,5 @@ class LatexOCRModel(nn.Module):
 
     def forward(self, images: torch.Tensor, tgt_seq: torch.Tensor, is_causal: bool = True) -> torch.Tensor:
         """训练时使用的完整前向传播"""
-        import torch.nn.functional as F
-
-        memory = self.encode(images)
-        batch_size = memory.size(0)
-
-        # 通过池化近似估计视觉 token 的无效填充区域
-        with torch.no_grad():
-            downsampled_mask = F.max_pool2d(images, kernel_size=32, stride=32)
-            memory_padding_mask = (downsampled_mask.view(batch_size, -1) <= 1e-5)
-
+        memory, memory_padding_mask = self.encode(images)
         return self.decode(memory, tgt_seq, memory_padding_mask, is_causal)

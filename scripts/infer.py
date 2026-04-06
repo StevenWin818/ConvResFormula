@@ -1,7 +1,6 @@
 """自回归推理脚本入口。"""
 
 import torch
-import torch.nn.functional as F
 
 
 @torch.no_grad()
@@ -14,9 +13,7 @@ def batched_infer_ar(model, images, tokenizer, max_len=160):
     pad_id = tokenizer.token_to_id("[PAD]")
 
     # 1. 只跑一次视觉编码
-    memory = model.encode(images)
-    downsampled_mask = F.max_pool2d(images, kernel_size=32, stride=32)
-    memory_padding_mask = (downsampled_mask.view(batch_size, -1) <= 1e-5)
+    memory, memory_padding_mask = model.encode(images)
 
     # 2. 以 [BOS] 作为起始序列
     generated = torch.full((batch_size, 1), bos_id, dtype=torch.long, device=device)

@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 import torch
-import torch.nn.functional as F
 from tokenizers import Tokenizer
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
@@ -100,10 +99,7 @@ def batched_infer_ar(
 	device = images.device
 
 	with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled):
-		memory = model.encode(images)
-
-	downsampled_mask = F.max_pool2d(images, kernel_size=32, stride=32)
-	memory_padding_mask = (downsampled_mask.view(batch_size, -1) <= 1e-5)
+		memory, memory_padding_mask = model.encode(images)
 
 	generated = torch.full((batch_size, 1), bos_id, dtype=torch.long, device=device)
 	finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
