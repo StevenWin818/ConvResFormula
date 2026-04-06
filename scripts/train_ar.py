@@ -118,6 +118,35 @@ def load_yaml_config(path: str) -> Dict[str, Any]:
 	return data if isinstance(data, dict) else {}
 
 
+def get_best_loss_from_log(log_path: str, max_epoch: int | None = None) -> float | None:
+	"""从训练日志回溯历史最小 loss，兼容旧 checkpoint 的 best_loss 滞后问题。"""
+	if not os.path.exists(log_path):
+		return None
+
+	best_loss: float | None = None
+	with open(log_path, "r", encoding="utf-8") as f:
+		_ = f.readline()  # skip header
+		for line in f:
+			parts = line.strip().split("\t")
+			if len(parts) < 3:
+				continue
+			try:
+				epoch = int(parts[1])
+				loss = float(parts[2])
+			except ValueError:
+				continue
+
+			if max_epoch is not None and epoch > max_epoch:
+				continue
+			if not np.isfinite(loss):
+				continue
+
+			if best_loss is None or loss < best_loss:
+				best_loss = loss
+
+	return best_loss
+
+
 def apply_config_defaults(args: argparse.Namespace, train_cfg: Dict[str, Any], model_cfg: Dict[str, Any]) -> None:
 	args.train_h5 = args.train_h5 or _cfg_get(train_cfg, ("data", "train_h5"), [])
 	args.tokenizer = args.tokenizer or _cfg_get(train_cfg, ("data", "tokenizer"))
@@ -235,7 +264,7 @@ class RatioBucketBatchSampler(Sampler[List[int]]):
 		seed: int = 42,
 		mega_factor: int = 30,
 		aspect_bin_edges: Sequence[float] = (0.55, 0.75, 0.9, 1.1, 1.35, 1.7, 2.2, 3.0, 4.2, 6.0),
-		drop_last: bool = True,
+		drop_last: bool = False,
 	):
 		if (
 			len(lengths) != len(ratios)
@@ -280,6 +309,8 @@ class RatioBucketBatchSampler(Sampler[List[int]]):
 			self.batch_count = self.sample_count // self.batch_size
 		else:
 			self.batch_count = (self.sample_count + self.batch_size - 1) // self.batch_size
+		self._epoch_batches: List[List[int]] = []
+		self._built_epoch: int | None = None
 
 	def _build_target_counts(self, total_samples: int) -> List[int]:
 		ratio_sum = sum(self.ratios)
@@ -299,7 +330,13 @@ class RatioBucketBatchSampler(Sampler[List[int]]):
 		return int_counts
 
 	def set_epoch(self, epoch: int) -> None:
-		self.epoch = int(epoch)
+		new_epoch = int(epoch)
+		if self.epoch == new_epoch and self._built_epoch == new_epoch:
+			return
+		self.epoch = new_epoch
+		if self._built_epoch != self.epoch:
+			self._epoch_batches = []
+			self._built_epoch = None
 
 	def _aspect_bin(self, aspect: float) -> int:
 		for i, edge in enumerate(self.aspect_bin_edges):
@@ -307,7 +344,7 @@ class RatioBucketBatchSampler(Sampler[List[int]]):
 				return i
 		return len(self.aspect_bin_edges)
 
-	def __iter__(self):
+	def _rebuild_epoch_batches(self) -> None:
 		rng = random.Random(self.seed + self.epoch)
 		pool: List[Tuple[int, int, float, float, float]] = []
 
@@ -340,6 +377,8 @@ class RatioBucketBatchSampler(Sampler[List[int]]):
 		mega_size = self.batch_size * self.mega_factor
 		mega_starts = list(range(0, len(pool), mega_size))
 		rng.shuffle(mega_starts)
+		epoch_batches: List[List[int]] = []
+		spill_items: List[Tuple[int, int, float, float, float]] = []
 
 		for start in mega_starts:
 			mega = pool[start: start + mega_size]
@@ -348,25 +387,75 @@ class RatioBucketBatchSampler(Sampler[List[int]]):
 				bin_groups.setdefault(item[1], []).append(item)
 
 			local_batches: List[List[int]] = []
+			local_spill: List[Tuple[int, int, float, float, float]] = []
 			bin_ids = list(bin_groups.keys())
 			rng.shuffle(bin_ids)
 			for bin_id in bin_ids:
 				group = bin_groups[bin_id]
 				group.sort(key=lambda item: (item[2], item[3], item[4] + rng.uniform(-1e-6, 1e-6)))
+				full_end = (len(group) // self.batch_size) * self.batch_size
 
-				for i in range(0, len(group), self.batch_size):
+				for i in range(0, full_end, self.batch_size):
 					chunk = group[i: i + self.batch_size]
-					if len(chunk) < self.batch_size and self.drop_last:
-						continue
 					batch_indices = [idx for idx, _, _, _, _ in chunk]
 					rng.shuffle(batch_indices)
 					local_batches.append(batch_indices)
 
+				if full_end < len(group):
+					local_spill.extend(group[full_end:])
+
 			rng.shuffle(local_batches)
-			for batch in local_batches:
-				yield batch
+			epoch_batches.extend(local_batches)
+			rng.shuffle(local_spill)
+			spill_items.extend(local_spill)
+
+		spill_groups: Dict[int, List[Tuple[int, int, float, float, float]]] = {}
+		for item in spill_items:
+			spill_groups.setdefault(item[1], []).append(item)
+
+		spill_tail_indices: List[int] = []
+		spill_bin_ids = list(spill_groups.keys())
+		rng.shuffle(spill_bin_ids)
+		for bin_id in spill_bin_ids:
+			group = spill_groups[bin_id]
+			group.sort(key=lambda item: (item[2], item[3], item[4] + rng.uniform(-1e-6, 1e-6)))
+			full_end = (len(group) // self.batch_size) * self.batch_size
+
+			for i in range(0, full_end, self.batch_size):
+				chunk = group[i: i + self.batch_size]
+				batch_indices = [idx for idx, _, _, _, _ in chunk]
+				rng.shuffle(batch_indices)
+				epoch_batches.append(batch_indices)
+
+			if full_end < len(group):
+				spill_tail_indices.extend(idx for idx, _, _, _, _ in group[full_end:])
+
+		rng.shuffle(spill_tail_indices)
+		if self.drop_last:
+			usable = (len(spill_tail_indices) // self.batch_size) * self.batch_size
+			spill_tail_indices = spill_tail_indices[:usable]
+
+		for i in range(0, len(spill_tail_indices), self.batch_size):
+			chunk = spill_tail_indices[i: i + self.batch_size]
+			if len(chunk) < self.batch_size and self.drop_last:
+				continue
+			rng.shuffle(chunk)
+			epoch_batches.append(chunk)
+
+		rng.shuffle(epoch_batches)
+		self._epoch_batches = epoch_batches
+		self.batch_count = len(self._epoch_batches)
+		self._built_epoch = self.epoch
+
+	def __iter__(self):
+		if self._built_epoch != self.epoch:
+			self._rebuild_epoch_batches()
+		for batch in self._epoch_batches:
+			yield batch
 
 	def __len__(self) -> int:
+		if self._built_epoch == self.epoch:
+			return len(self._epoch_batches)
 		return self.batch_count
 
 
@@ -577,8 +666,9 @@ def main() -> None:
 	set_seed(args.seed)
 
 	# 强制关闭动态形状下的底层重编译/寻优抖动
-	torch.backends.cudnn.benchmark = False
-	torch.backends.cudnn.deterministic = True
+	torch.backends.cudnn.benchmark = bool(args.cudnn_benchmark)
+	# benchmark=True 时关闭 deterministic 以释放 cudnn 算法选择性能。
+	torch.backends.cudnn.deterministic = not bool(args.cudnn_benchmark)
 
 	os.makedirs(args.ckpt_dir, exist_ok=True)
 	os.makedirs(args.log_dir, exist_ok=True)
@@ -651,7 +741,7 @@ def main() -> None:
 		batch_size=args.batch_size,
 		seed=args.seed,
 		mega_factor=args.bucket_mega_factor,
-		drop_last=True,
+		drop_last=False,
 	)
 
 	collate_fn = ARCollate(
@@ -705,7 +795,13 @@ def main() -> None:
 		eta_min=args.eta_min,
 	)
 
-	scaler = torch.cuda.amp.GradScaler(enabled=True) if (device.type == "cuda" and args.amp_dtype == "fp16") else None
+	scaler = None
+	if device.type == "cuda" and args.amp_dtype == "fp16":
+		new_grad_scaler = getattr(torch.amp, "GradScaler", None)
+		if new_grad_scaler is not None:
+			scaler = new_grad_scaler("cuda", enabled=True)
+		else:
+			scaler = torch.cuda.amp.GradScaler(enabled=True)
 	trainer = ARTrainer(
 		model=model,
 		optimizer=optimizer,
@@ -732,6 +828,21 @@ def main() -> None:
 		start_epoch = int(checkpoint.get("epoch", 0)) + 1
 		best_loss = float(checkpoint.get("best_loss", best_loss))
 		best_em = float(checkpoint.get("best_em", best_em))
+
+		best_ckpt_path = os.path.join(os.path.dirname(args.resume_ckpt), "best.pth")
+		if os.path.exists(best_ckpt_path):
+			best_ckpt = torch.load(best_ckpt_path, map_location=device, weights_only=False)
+			best_loss = min(best_loss, float(best_ckpt.get("best_loss", best_loss)))
+			best_em = max(best_em, float(best_ckpt.get("best_em", best_em)))
+
+		best_loss_ckpt_path = os.path.join(os.path.dirname(args.resume_ckpt), "best_loss.pth")
+		if os.path.exists(best_loss_ckpt_path):
+			best_loss_ckpt = torch.load(best_loss_ckpt_path, map_location=device, weights_only=False)
+			best_loss = min(best_loss, float(best_loss_ckpt.get("best_loss", best_loss)))
+
+		log_best_loss = get_best_loss_from_log(log_path=log_path, max_epoch=start_epoch - 1)
+		if log_best_loss is not None:
+			best_loss = min(best_loss, float(log_best_loss))
 		print(f"恢复训练: epoch={start_epoch}, best_loss={best_loss:.4f}, best_em={best_em * 100:.2f}%")
 
 	if not os.path.exists(log_path):
@@ -815,6 +926,13 @@ def main() -> None:
 				f"{lr_enc:.8e}\t{lr_dec:.8e}\n"
 			)
 
+		is_best_em = eval_em >= best_em
+		is_best_loss = avg_loss <= best_loss
+		if is_best_em:
+			best_em = eval_em
+		if is_best_loss:
+			best_loss = avg_loss
+
 		ckpt_payload: Dict[str, object] = {
 			"epoch": epoch,
 			"model": model.state_dict(),
@@ -834,6 +952,7 @@ def main() -> None:
 		latest_ckpt = os.path.join(args.ckpt_dir, "latest.pth")
 		epoch_ckpt = os.path.join(args.ckpt_dir, f"epoch_{epoch}.pth")
 		best_ckpt = os.path.join(args.ckpt_dir, "best.pth")
+		best_loss_ckpt = os.path.join(args.ckpt_dir, "best_loss.pth")
 
 		torch.save(ckpt_payload, latest_ckpt)
 		torch.save(ckpt_payload, epoch_ckpt)
@@ -844,15 +963,12 @@ def main() -> None:
 				for key, count in error_counter.most_common(20):
 					ef.write(f"[{count:5d}] {key}\n")
 
-		if eval_em >= best_em:
-			best_em = eval_em
-			ckpt_payload["best_em"] = best_em
+		if is_best_em:
 			torch.save(ckpt_payload, best_ckpt)
 			print(f"更新 best checkpoint: {best_ckpt} | best_em={best_em * 100:.2f}%")
 
-		if avg_loss <= best_loss:
-			best_loss = avg_loss
-			ckpt_payload["best_loss"] = best_loss
+		if is_best_loss:
+			torch.save(ckpt_payload, best_loss_ckpt)
 			print(f"更新最小训练损失: {best_loss:.4f}")
 
 	print("\nAR 训练完成。")

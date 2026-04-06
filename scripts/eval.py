@@ -28,7 +28,7 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--checkpoint", type=str, default=r"checkpoints\ar\best.pth")
 	parser.add_argument("--d_model", type=int, default=512)
 	parser.add_argument("--max_area", type=int, default=98304)
-	parser.add_argument("--batch_size", type=int, default=32)
+	parser.add_argument("--batch_size", type=int, default=64)
 	parser.add_argument("--num_workers", type=int, default=2)
 	parser.add_argument("--max_len", type=int, default=160)
 	parser.add_argument("--max_samples", type=int, default=0, help="评估样本数上限，<=0 表示全量")

@@ -42,7 +42,7 @@ runtime:
   ckpt_dir: checkpoints/ar # checkpoint 输出目录
   log_dir: logs/ar_logs # 日志输出目录
   resume_ckpt: checkpoints/ar/latest.pth # 恢复训练使用的 checkpoint
-  resume: false # 是否默认启用断点恢复
+  resume: True # 是否默认启用断点恢复
   amp_dtype: fp16 # 训练精度类型(fp16/bf16/fp32)
   cudnn_benchmark: true # 为固定/重复 shape 自动选择更快内核
   kernel_warmup_batches: 2 # 训练前预热批次数，过大可能显著拉长首轮启动
