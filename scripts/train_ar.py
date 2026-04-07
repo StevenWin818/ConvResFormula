@@ -707,12 +707,22 @@ def main() -> None:
 		FormulaDataset(h5_path=path, tokenizer_path=args.tokenizer, max_area=args.max_area, enable_augment=True)
 		for path in dataset_paths
 	]
-	train_dataset = datasets[0] if len(datasets) == 1 else ConcatDataset(datasets)
 
 	if len(args.mix_ratio) != len(datasets):
 		raise ValueError(
 			f"mix_ratio 长度({len(args.mix_ratio)})必须与训练数据集数量({len(datasets)})一致"
 		)
+
+	# 根据 mix_ratio 过滤掉比例为 0 的数据集
+	enabled_indices = [i for i, ratio in enumerate(args.mix_ratio) if ratio > 0]
+	if not enabled_indices:
+		raise ValueError(f"mix_ratio 全为 0，没有有效的数据源。请检查配置: {args.mix_ratio}")
+
+	datasets = [datasets[i] for i in enabled_indices]
+	args.mix_ratio = [args.mix_ratio[i] for i in enabled_indices]
+	dataset_paths = [dataset_paths[i] for i in enabled_indices]
+
+	train_dataset = datasets[0] if len(datasets) == 1 else ConcatDataset(datasets)
 
 	dataset_lengths = [len(ds) for ds in datasets]
 	aspect_ratios = [np.asarray(ds.aspect_ratios, dtype=np.float32) for ds in datasets]

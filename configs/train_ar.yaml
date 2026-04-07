@@ -3,7 +3,8 @@ data:
     - C:/Projects/LatexProject/ConvResFormula/datasets/train.h5 # 手写训练集
     - C:/Projects/LatexProject/ConvResFormula/datasets/synthetic.h5 # 合成训练集
     - C:/Projects/LatexProject/ConvResFormula/datasets/symbols.h5 # 单字符训练集
-  eval_h5: C:/Projects/LatexProject/ConvResFormula/datasets/val.h5 # 验证/评估集
+    - C:/Projects/LatexProject/ConvResFormula/datasets/wiki_train_314k.h5 # wiki训练集
+  eval_h5: C:/Projects/LatexProject/ConvResFormula/datasets/wiki_eval_5k.h5 # 验证/评估集
   tokenizer: C:/Projects/LatexProject/ConvResFormula/tokenizer_bpe.json # BPE 分词器
   max_area: 98304 # 图像动态缩放的面积上限
 
@@ -12,8 +13,8 @@ training:
   num_workers: 4 # 训练 DataLoader 线程数
   epochs: 20 # 总训练轮数
   seed: 42 # 随机种子
-  mix_ratio: [10, 10, 1] # 多数据源采样比例，手写:合成:单字符
-  epoch_samples: 0 # 每个 epoch 的采样总数，<=0 表示全量
+  mix_ratio: [0, 0, 0, 1] # 多数据源采样比例，手写:合成:单字符:wiki
+  epoch_samples: 314000 # 每个 epoch 的采样总数，<=0 表示全量
   bucket_mega_factor: 30 # 分桶 mega-batch 系数
 
 optimization:
