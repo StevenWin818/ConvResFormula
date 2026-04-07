@@ -41,8 +41,7 @@ class PositionalEncoding2D(nn.Module):
         pe[d_model_half+1::2, :, :] = torch.cos(x_embed).transpose(0, 1).unsqueeze(1).repeat(1, max_h, 1)
         
         # 注册为 buffer，这样它就不会成为模型可训练参数，但会随模型保存和移动(GPU/CPU)
-        self.register_buffer('pe', pe)
-        # 显式声明类型给 Pylance
+        self.register_buffer('pe', pe, persistent=False)        # 显式声明类型给 Pylance
         self.pe: torch.Tensor
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

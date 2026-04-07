@@ -197,7 +197,7 @@ def apply_config_defaults(args: argparse.Namespace, train_cfg: Dict[str, Any], m
 	args.ckpt_dir = args.ckpt_dir or str(_cfg_get(train_cfg, ("runtime", "ckpt_dir"), r"checkpoints\ar"))
 	args.log_dir = args.log_dir or str(_cfg_get(train_cfg, ("runtime", "log_dir"), r"logs\ar_logs"))
 	args.resume_ckpt = args.resume_ckpt or str(_cfg_get(train_cfg, ("runtime", "resume_ckpt"), r"checkpoints\ar\latest.pth"))
-	args.cudnn_benchmark = bool(_cfg_get(train_cfg, ("runtime", "cudnn_benchmark"), True))
+	args.cudnn_benchmark = bool(_cfg_get(train_cfg, ("runtime", "cudnn_benchmark"), False))
 	args.kernel_warmup_batches = int(_cfg_get(train_cfg, ("runtime", "kernel_warmup_batches"), 8))
     
 	if args.kernel_warmup_batches < 0:
@@ -819,7 +819,7 @@ def main() -> None:
 
 	if args.resume and os.path.exists(args.resume_ckpt):
 		checkpoint = torch.load(args.resume_ckpt, map_location=device, weights_only=False)
-		model.load_state_dict(checkpoint["model"], strict=True)
+		model.load_state_dict(checkpoint["model"], strict=False) 
 		optimizer.load_state_dict(checkpoint["optimizer"])
 		scheduler.load_state_dict(checkpoint["scheduler"])
 		if scaler is not None and checkpoint.get("scaler") is not None:
