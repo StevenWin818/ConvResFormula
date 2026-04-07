@@ -338,7 +338,7 @@ class RatioBucketBatchSampler(Sampler[List[int]]):
 		if self._built_epoch != self.epoch:
 			self._epoch_batches = []
 			self._built_epoch = None
-						logits, past_key_values = model.decode_step(
+
 	def _aspect_bin(self, aspect: float) -> int:
 		for i, edge in enumerate(self.aspect_bin_edges):
 			if aspect < edge:
@@ -346,7 +346,7 @@ class RatioBucketBatchSampler(Sampler[List[int]]):
 		return len(self.aspect_bin_edges)
 
 	def _rebuild_epoch_batches(self) -> None:
-					next_tokens = logits.argmax(dim=-1)
+		rng = random.Random(self.seed + self.epoch)
 		pool: List[Tuple[int, int, float, float, float]] = []
 
 		for length, ars, areas, hs, ws, need, offset in zip(
@@ -840,8 +840,11 @@ def main() -> None:
 		checkpoint = torch.load(args.resume_ckpt, map_location=device, weights_only=False)
 		model_state_dict = convert_legacy_attnres_state_dict(checkpoint["model"])
 		model.load_state_dict(model_state_dict, strict=False) 
-		optimizer.load_state_dict(checkpoint["optimizer"])
-		scheduler.load_state_dict(checkpoint["scheduler"])
+		try:
+			optimizer.load_state_dict(checkpoint["optimizer"])
+			scheduler.load_state_dict(checkpoint["scheduler"])
+		except ValueError as exc:
+			print(f"警告: checkpoint 的 optimizer/scheduler 状态与当前模型不兼容，已跳过恢复。原因: {exc}")
 		if scaler is not None and checkpoint.get("scaler") is not None:
 			scaler.load_state_dict(checkpoint["scaler"])
 
