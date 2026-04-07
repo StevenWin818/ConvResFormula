@@ -18,6 +18,7 @@ class ARTrainer:
         amp_enabled=False,
         amp_dtype=torch.float16,
         label_smoothing=0.0,
+        target_ignore_index=-100,
     ):
         """
         Args:
@@ -42,7 +43,8 @@ class ARTrainer:
             raise ValueError(f"label_smoothing 必须在 [0,1) 区间，当前为 {self.label_smoothing}")
         
         self.pad_id = int(getattr(model, "pad_id", 0))
-        self.criterion = nn.CrossEntropyLoss(ignore_index=self.pad_id, label_smoothing=self.label_smoothing)
+        self.target_ignore_index = int(target_ignore_index)
+        self.criterion = nn.CrossEntropyLoss(ignore_index=self.target_ignore_index, label_smoothing=self.label_smoothing)
 
     def _optimizer_step(self) -> None:
         if self.scaler is not None:
@@ -85,7 +87,7 @@ class ARTrainer:
                         loss.backward()
 
                     preds = logits.argmax(dim=-1)
-                    valid_mask = ar_tgt_chunk != self.pad_id
+                    valid_mask = ar_tgt_chunk != self.target_ignore_index
                     if valid_mask.any():
                         chunk_acc = (preds[valid_mask] == ar_tgt_chunk[valid_mask]).float().mean().item()
                     else:
@@ -128,11 +130,16 @@ class ARTrainer:
         pbar = tqdm(dataloader, desc=f"Epoch {epoch} [Train]")
         for batch_idx, batch in enumerate(pbar):
             images = batch["images"].to(self.device, non_blocking=True)
-            clean_token_ids = batch["clean_token_ids"].to(self.device, non_blocking=True)
 
-            # AR Teacher Forcing：输入去掉最后一个 token，目标右移一位
-            ar_inputs = clean_token_ids[:, :-1]
-            ar_targets = clean_token_ids[:, 1:].contiguous()
+            if "decoder_inputs" in batch and "labels" in batch:
+                ar_inputs = batch["decoder_inputs"].to(self.device, non_blocking=True)
+                ar_targets = batch["labels"].to(self.device, non_blocking=True).contiguous()
+            else:
+                clean_token_ids = batch["clean_token_ids"].to(self.device, non_blocking=True)
+                ar_inputs = clean_token_ids[:, :-1]
+                ar_targets = clean_token_ids[:, 1:].contiguous()
+                if self.target_ignore_index != self.pad_id:
+                    ar_targets = ar_targets.masked_fill(ar_targets == self.pad_id, self.target_ignore_index)
 
             batch_loss_sum, batch_acc_sum, success = self._train_step_with_retry(images, ar_inputs, ar_targets)
 

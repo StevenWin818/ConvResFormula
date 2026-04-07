@@ -203,14 +203,20 @@ class ARCollate:
     def __init__(
         self,
         pad_token_id,
+        bos_token_id,
+        eos_token_id,
         shape_quant_size=64,
         max_seq_len=256,
         area_limit=98304 * 1.5,
+        label_pad_value=-100,
     ):
         self.pad_token_id = int(pad_token_id)
+        self.bos_token_id = int(bos_token_id)
+        self.eos_token_id = int(eos_token_id)
         self.shape_quant_size = int(shape_quant_size)
         self.max_seq_len = int(max_seq_len)
         self.area_limit = float(area_limit)
+        self.label_pad_value = int(label_pad_value)
 
         if self.shape_quant_size <= 0:
             raise ValueError(f"shape_quant_size 必须 > 0，当前为 {self.shape_quant_size}")
@@ -221,7 +227,8 @@ class ARCollate:
 
     def __call__(self, batch):
         images = []
-        input_ids_list = []
+        decoder_input_ids_list = []
+        label_ids_list = []
 
         for item in batch:
             images.append(item["image"])
@@ -230,10 +237,24 @@ class ARCollate:
             if not isinstance(seq, torch.Tensor):
                 seq = torch.tensor(seq, dtype=torch.long)
 
-            if seq.numel() > self.max_seq_len:
-                seq = seq[: self.max_seq_len]
+            seq = seq.to(dtype=torch.long)
 
-            input_ids_list.append(seq)
+            # 统一去除已有特殊符号后再重建，兼容“原始字符串标签编码”和“已含 BOS/EOS 的 token 标签”。
+            if seq.numel() > 0 and int(seq[0].item()) == self.bos_token_id:
+                seq = seq[1:]
+            if seq.numel() > 0 and int(seq[-1].item()) == self.eos_token_id:
+                seq = seq[:-1]
+
+            if seq.numel() > 0:
+                seq = seq[seq != self.pad_token_id]
+
+            if seq.numel() > self.max_seq_len - 1:
+                seq = seq[: self.max_seq_len - 1]
+
+            bos = torch.tensor([self.bos_token_id], dtype=torch.long)
+            eos = torch.tensor([self.eos_token_id], dtype=torch.long)
+            decoder_input_ids_list.append(torch.cat([bos, seq], dim=0))
+            label_ids_list.append(torch.cat([seq, eos], dim=0))
 
         if len(images) > 0 and isinstance(images[0], torch.Tensor):
             max_h = max(int(img.shape[1]) for img in images)
@@ -283,12 +304,11 @@ class ARCollate:
 
             images = batched_images
 
-        clean_token_ids = pad_sequence(input_ids_list, batch_first=True, padding_value=self.pad_token_id)
+        decoder_inputs = pad_sequence(decoder_input_ids_list, batch_first=True, padding_value=self.pad_token_id)
+        labels = pad_sequence(label_ids_list, batch_first=True, padding_value=self.label_pad_value)
 
         return {
             "images": images,
-            "clean_token_ids": clean_token_ids,
-            # 为兼容旧逻辑保留 labels，同 clean_token_ids
-            "labels": clean_token_ids,
+            "decoder_inputs": decoder_inputs,
+            "labels": labels,
         }
-     

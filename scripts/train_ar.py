@@ -654,10 +654,14 @@ def warmup_kernel_cache(
 				break
 
 			images = batch["images"].to(device, non_blocking=True)
-			clean_token_ids = batch["clean_token_ids"].to(device, non_blocking=True)
+			if "decoder_inputs" in batch:
+				decoder_inputs = batch["decoder_inputs"].to(device, non_blocking=True)
+			else:
+				clean_token_ids = batch["clean_token_ids"].to(device, non_blocking=True)
+				decoder_inputs = clean_token_ids[:, :-1]
 
 			with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-				_ = model(images=images, tgt_seq=clean_token_ids[:, :-1], is_causal=True)
+				_ = model(images=images, tgt_seq=decoder_inputs, is_causal=True)
 
 			steps += 1
 
@@ -765,6 +769,8 @@ def main() -> None:
 
 	collate_fn = ARCollate(
 		pad_token_id=pad_id,
+		bos_token_id=bos_id,
+		eos_token_id=eos_id,
 	)
 
 	train_loader = DataLoader(
@@ -830,6 +836,7 @@ def main() -> None:
 		amp_enabled=amp_enabled,
 		amp_dtype=amp_dtype,
 		label_smoothing=args.label_smoothing,
+		target_ignore_index=-100,
 	)
 
 	start_epoch = 1
