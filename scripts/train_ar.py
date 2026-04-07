@@ -32,6 +32,7 @@ from src.data.dataset import FormulaDataset
 from src.engine.lr_schedulers import build_linear_warmup_cosine_scheduler, infer_total_steps
 from src.engine.trainer import ARTrainer
 from src.models.latex_ocr_model import LatexOCRModel
+from src.models.text_decoder import convert_legacy_attnres_state_dict
 
 
 def parse_args() -> argparse.Namespace:
@@ -337,7 +338,7 @@ class RatioBucketBatchSampler(Sampler[List[int]]):
 		if self._built_epoch != self.epoch:
 			self._epoch_batches = []
 			self._built_epoch = None
-
+						logits, past_key_values = model.decode_step(
 	def _aspect_bin(self, aspect: float) -> int:
 		for i, edge in enumerate(self.aspect_bin_edges):
 			if aspect < edge:
@@ -345,7 +346,7 @@ class RatioBucketBatchSampler(Sampler[List[int]]):
 		return len(self.aspect_bin_edges)
 
 	def _rebuild_epoch_batches(self) -> None:
-		rng = random.Random(self.seed + self.epoch)
+					next_tokens = logits.argmax(dim=-1)
 		pool: List[Tuple[int, int, float, float, float]] = []
 
 		for length, ars, areas, hs, ws, need, offset in zip(
@@ -522,17 +523,25 @@ def batched_infer_ar(
 	# 视觉特征在一次迭代解码中不变，仅提取一次并复用
 	with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
 		memory, memory_padding_mask = model.encode(images)
+		decode_cache = model.init_decode_cache(memory)
 
-	generated = torch.full((batch_size, 1), bos_id, dtype=torch.long, device=device)
+	generated = torch.full((batch_size, max_len), pad_id, dtype=torch.long, device=device)
+	generated[:, 0] = bos_id
 	finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
 
-	for _ in range(max_len - 1):
+	for step in range(1, max_len):
 		with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-			logits = model.decode(memory=memory, tgt_seq=generated, memory_padding_mask=memory_padding_mask, is_causal=True)
+			current_token = generated[:, step - 1]
+			logits, decode_cache = model.decode_step_cached(
+				memory=memory,
+				token_id=current_token,
+				cache=decode_cache,
+				memory_padding_mask=memory_padding_mask,
+			)
 
-		next_tokens = logits[:, -1, :].argmax(dim=-1)
+		next_tokens = logits.argmax(dim=-1)
 		next_tokens = next_tokens.masked_fill(finished, pad_id)
-		generated = torch.cat([generated, next_tokens.unsqueeze(1)], dim=1)
+		generated[:, step] = next_tokens
 		finished |= (next_tokens == eos_id)
 		if finished.all():
 			break
@@ -829,7 +838,8 @@ def main() -> None:
 
 	if args.resume and os.path.exists(args.resume_ckpt):
 		checkpoint = torch.load(args.resume_ckpt, map_location=device, weights_only=False)
-		model.load_state_dict(checkpoint["model"], strict=False) 
+		model_state_dict = convert_legacy_attnres_state_dict(checkpoint["model"])
+		model.load_state_dict(model_state_dict, strict=False) 
 		optimizer.load_state_dict(checkpoint["optimizer"])
 		scheduler.load_state_dict(checkpoint["scheduler"])
 		if scaler is not None and checkpoint.get("scaler") is not None:

@@ -8,6 +8,7 @@ from datetime import datetime
 from functools import partial
 from pathlib import Path
 from typing import Dict, List, Tuple
+from typing import cast
 
 import torch
 from tokenizers import Tokenizer
@@ -21,6 +22,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.data.dataset import FormulaDataset
 from src.models.latex_ocr_model import LatexOCRModel
+from src.models.text_decoder import convert_legacy_attnres_state_dict
 def parse_args() -> argparse.Namespace:
 	parser = argparse.ArgumentParser(description="AR 贪心解码评估脚本")
 	parser.add_argument("--eval_h5", type=str, default=r"C:\Projects\LatexProject\ConvResFormula\datasets\val.h5")
@@ -28,8 +30,8 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--checkpoint", type=str, default=r"checkpoints\ar\best.pth")
 	parser.add_argument("--d_model", type=int, default=512)
 	parser.add_argument("--max_area", type=int, default=98304)
-	parser.add_argument("--batch_size", type=int, default=64)
-	parser.add_argument("--num_workers", type=int, default=2)
+	parser.add_argument("--batch_size", type=int, default=32)
+	parser.add_argument("--num_workers", type=int, default=4)
 	parser.add_argument("--max_len", type=int, default=160)
 	parser.add_argument("--max_samples", type=int, default=0, help="评估样本数上限，<=0 表示全量")
 	parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -100,17 +102,28 @@ def batched_infer_ar(
 
 	with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled):
 		memory, memory_padding_mask = model.encode(images)
+		decode_cache = model.init_decode_cache(memory)
 
-	generated = torch.full((batch_size, 1), bos_id, dtype=torch.long, device=device)
+	generated = torch.full((batch_size, max_len), pad_id, dtype=torch.long, device=device)
+	generated[:, 0] = bos_id
 	finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
-
-	for _ in range(max_len - 1):
+	# 循环从步数 1 开始，直到 max_len
+	for step in range(1, max_len):
 		with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled):
-			logits = model.decode(memory, generated, memory_padding_mask, is_causal=True)
+			current_token = generated[:, step - 1]
+			logits, decode_cache = model.decode_step_cached(
+				memory=memory,
+				token_id=current_token,
+				cache=decode_cache,
+				memory_padding_mask=memory_padding_mask,
+			)
 
-		next_tokens = logits[:, -1, :].argmax(dim=-1)
+		next_tokens = logits.argmax(dim=-1)
 		next_tokens = next_tokens.masked_fill(finished, pad_id)
-		generated = torch.cat([generated, next_tokens.unsqueeze(1)], dim=1)
+
+		# 直接原地切片赋值，避免逐步拼接带来的额外开销。
+		generated[:, step] = next_tokens
+
 		finished |= (next_tokens == eos_id)
 		if finished.all():
 			break
@@ -137,8 +150,11 @@ def build_model(checkpoint_path: str, tokenizer: Tokenizer, d_model: int, device
 
 	checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 	state_dict = checkpoint.get("model", checkpoint)
+	state_dict = convert_legacy_attnres_state_dict(state_dict)
 	model.load_state_dict(state_dict, strict=True)
 	model.eval()
+	if hasattr(torch, "compile"):
+		model = cast(LatexOCRModel, torch.compile(model))
 	return model
 
 

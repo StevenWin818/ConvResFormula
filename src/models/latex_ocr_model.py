@@ -7,7 +7,7 @@ import torch.nn as nn
 from typing import Optional, Tuple
 
 from .vision_encoder import ConvNeXtV2Encoder
-from .text_decoder import AttnResTextDecoder
+from .text_decoder import AttnResDecodeCache, AttnResTextDecoder
 
 class PositionalEncoding1D(nn.Module):
     """标准的 1D 文本序列位置编码"""
@@ -23,9 +23,10 @@ class PositionalEncoding1D(nn.Module):
         self.register_buffer('pe', pe.transpose(0, 1))
         self.pe: torch.Tensor
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, start_pos: int = 0) -> torch.Tensor:
         """x: [Batch, SeqLen, d_model]"""
-        x = x + self.pe[:, :x.size(1), :]
+        seq_len = x.size(1)
+        x = x + self.pe[:, start_pos:start_pos + seq_len, :]
         return self.dropout(x)
 
 
@@ -81,6 +82,14 @@ class LatexOCRModel(nn.Module):
         """返回特征序列和 Padding 掩码"""
         return self.encoder(images)
 
+    def precompute_cross_kv(self, memory: torch.Tensor):
+        """预计算解码器交叉注意力 K/V，用于自回归推理。"""
+        return self.decoder.precompute_cross_kv(memory)
+
+    def init_decode_cache(self, memory: torch.Tensor) -> AttnResDecodeCache:
+        """初始化自回归解码缓存。"""
+        return self.decoder.init_cache(memory)
+
     def decode(
         self,
         memory: torch.Tensor,
@@ -105,6 +114,71 @@ class LatexOCRModel(nn.Module):
         )
         logits = self.head(decoder_out)
         return logits
+
+    def decode_step(
+        self,
+        memory: torch.Tensor,
+        token_id: torch.Tensor,
+        past_key_values=None,
+        memory_padding_mask: Optional[torch.Tensor] = None,
+        precomputed_cross_kvs=None,
+    ):
+        """单步自回归解码，配合 KV Cache 使用。"""
+        if token_id.dim() == 1:
+            token_id = token_id.unsqueeze(1)
+        if token_id.dim() != 2 or token_id.size(1) != 1:
+            raise ValueError(f"decode_step 需要形状为 [B] 或 [B, 1] 的 token_id，当前为 {tuple(token_id.shape)}")
+
+        if past_key_values is not None and len(past_key_values) > 0:
+            start_pos = int(past_key_values[0][0].size(2))
+        else:
+            start_pos = 0
+
+        tgt_emb = self.text_embedding(token_id) * math.sqrt(self.d_model)
+        tgt_emb = self.text_pos_enc(tgt_emb, start_pos=start_pos)
+
+        if precomputed_cross_kvs is None:
+            precomputed_cross_kvs = self.precompute_cross_kv(memory)
+
+        decoder_out, new_key_values = self.decoder.forward_step(
+            text_embeddings=tgt_emb,
+            cross_features=memory,
+            past_key_values=past_key_values,
+            memory_key_padding_mask=memory_padding_mask,
+            precomputed_cross_kvs=precomputed_cross_kvs,
+        )
+        logits = self.head(decoder_out.squeeze(1))
+        return logits, new_key_values
+
+    def decode_step_cached(
+        self,
+        memory: torch.Tensor,
+        token_id: torch.Tensor,
+        cache: AttnResDecodeCache,
+        memory_padding_mask: Optional[torch.Tensor] = None,
+    ):
+        """单步自回归解码，使用显式 KV Cache 容器。"""
+        if token_id.dim() == 1:
+            token_id = token_id.unsqueeze(1)
+        if token_id.dim() != 2 or token_id.size(1) != 1:
+            raise ValueError(f"decode_step_cached 需要形状为 [B] 或 [B, 1] 的 token_id，当前为 {tuple(token_id.shape)}")
+
+        if cache.self_key_values and cache.self_key_values[0] is not None:
+            start_pos = int(cache.self_key_values[0][0].size(2))
+        else:
+            start_pos = 0
+
+        tgt_emb = self.text_embedding(token_id) * math.sqrt(self.d_model)
+        tgt_emb = self.text_pos_enc(tgt_emb, start_pos=start_pos)
+
+        decoder_out, new_cache = self.decoder.forward_step_cached(
+            text_embeddings=tgt_emb,
+            cross_features=memory,
+            cache=cache,
+            memory_key_padding_mask=memory_padding_mask,
+        )
+        logits = self.head(decoder_out.squeeze(1))
+        return logits, new_cache
 
     def forward(self, images: torch.Tensor, tgt_seq: torch.Tensor, is_causal: bool = True) -> torch.Tensor:
         """训练时使用的完整前向传播"""
