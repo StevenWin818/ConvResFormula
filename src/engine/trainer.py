@@ -19,6 +19,7 @@ class ARTrainer:
         amp_dtype=torch.float16,
         label_smoothing=0.0,
         target_ignore_index=-100,
+        ema_model=None,
     ):
         """
         Args:
@@ -39,6 +40,7 @@ class ARTrainer:
         self.amp_enabled = bool(amp_enabled)
         self.amp_dtype = amp_dtype
         self.label_smoothing = float(label_smoothing)
+        self.ema_model = ema_model
         if not (0.0 <= self.label_smoothing < 1.0):
             raise ValueError(f"label_smoothing 必须在 [0,1) 区间，当前为 {self.label_smoothing}")
         
@@ -98,6 +100,8 @@ class ARTrainer:
 
                 self._optimizer_step()
                 self.scheduler.step()
+                if self.ema_model is not None:
+                    self.ema_model.update_parameters(self.model)
                 return batch_loss_sum, batch_acc_sum, True
 
             except torch.cuda.OutOfMemoryError:

@@ -8,7 +8,7 @@ from collections import Counter
 from datetime import datetime
 from functools import partial
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple, cast
 
 import numpy as np
 import torch
@@ -16,6 +16,7 @@ import torch.optim as optim
 from tokenizers import Tokenizer
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import ConcatDataset, DataLoader, Sampler
+from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 from tqdm import tqdm
 
 try:
@@ -827,17 +828,8 @@ def main() -> None:
 			scaler = new_grad_scaler("cuda", enabled=True)
 		else:
 			scaler = torch.cuda.amp.GradScaler(enabled=True)
-	trainer = ARTrainer(
-		model=model,
-		optimizer=optimizer,
-		scheduler=scheduler,
-		device=device,
-		scaler=scaler,
-		amp_enabled=amp_enabled,
-		amp_dtype=amp_dtype,
-		label_smoothing=args.label_smoothing,
-		target_ignore_index=-100,
-	)
+	ema_avg_fn = get_ema_multi_avg_fn(decay=0.999)
+	ema_model: AveragedModel | None = None
 
 	start_epoch = 1
 	best_loss = float("inf")
@@ -845,13 +837,38 @@ def main() -> None:
 
 	if args.resume and os.path.exists(args.resume_ckpt):
 		checkpoint = torch.load(args.resume_ckpt, map_location=device, weights_only=False)
-		model_state_dict = convert_legacy_attnres_state_dict(checkpoint["model"])
-		model.load_state_dict(model_state_dict, strict=False) 
-		try:
-			optimizer.load_state_dict(checkpoint["optimizer"])
-			scheduler.load_state_dict(checkpoint["scheduler"])
-		except ValueError as exc:
-			print(f"警告: checkpoint 的 optimizer/scheduler 状态与当前模型不兼容，已跳过恢复。原因: {exc}")
+
+		# 使用 .get() 安全获取模型，兼容纯权重字典
+		state_dict = checkpoint.get("model_raw", checkpoint.get("model", checkpoint))
+		model_state_dict = convert_legacy_attnres_state_dict(state_dict)
+		model.load_state_dict(model_state_dict, strict=False)
+
+		ema_model = AveragedModel(model, multi_avg_fn=ema_avg_fn)
+		ema_state_dict = checkpoint.get("ema_model")
+		if isinstance(ema_state_dict, dict):
+			try:
+				ema_model.load_state_dict(ema_state_dict)
+				print("成功恢复 EMA 模型状态。")
+			except ValueError as exc:
+				print(f"警告: EMA 状态与当前模型不兼容，已跳过恢复。原因: {exc}")
+		elif checkpoint.get("ema_model_module") is not None:
+			try:
+				ema_model.module.load_state_dict(checkpoint["ema_model_module"], strict=False)
+				print("成功恢复 EMA module 状态。")
+			except ValueError as exc:
+				print(f"警告: EMA module 状态与当前模型不兼容，已跳过恢复。原因: {exc}")
+
+		# 安全检查：只有当 checkpoint 里确实包含 optimizer 时才去加载
+		if "optimizer" in checkpoint and "scheduler" in checkpoint:
+			try:
+				optimizer.load_state_dict(checkpoint["optimizer"])
+				scheduler.load_state_dict(checkpoint["scheduler"])
+				print("成功恢复 Optimizer 和 Scheduler 状态。")
+			except ValueError as exc:
+				print(f"警告: checkpoint 的 optimizer/scheduler 状态与当前模型不兼容，已跳过恢复。原因: {exc}")
+		else:
+			print("提示: 未在 checkpoint 中找到 optimizer，已作为全新微调任务启动（仅加载模型权重）。")
+
 		if scaler is not None and checkpoint.get("scaler") is not None:
 			scaler.load_state_dict(checkpoint["scaler"])
 
@@ -874,6 +891,22 @@ def main() -> None:
 		if log_best_loss is not None:
 			best_loss = min(best_loss, float(log_best_loss))
 		print(f"恢复训练: epoch={start_epoch}, best_loss={best_loss:.4f}, best_em={best_em * 100:.2f}%")
+
+	if ema_model is None:
+		ema_model = AveragedModel(model, multi_avg_fn=ema_avg_fn)
+
+	trainer = ARTrainer(
+		model=model,
+		optimizer=optimizer,
+		scheduler=scheduler,
+		device=device,
+		scaler=scaler,
+		amp_enabled=amp_enabled,
+		amp_dtype=amp_dtype,
+		label_smoothing=args.label_smoothing,
+		target_ignore_index=-100,
+		ema_model=ema_model,
+	)
 
 	if not os.path.exists(log_path):
 		with open(log_path, "w", encoding="utf-8") as f:
@@ -913,6 +946,7 @@ def main() -> None:
 	for epoch in range(start_epoch, args.epochs + 1):
 		train_batch_sampler.set_epoch(epoch)
 		avg_loss, avg_acc = trainer.train_epoch(train_loader, epoch=epoch, log_interval=args.log_interval)
+		eval_model = cast(LatexOCRModel, ema_model.module if ema_model is not None else model)
 
 		eval_processed = 0.0
 		eval_exact = 0.0
@@ -922,7 +956,7 @@ def main() -> None:
 
 		if (not args.skip_eval) and eval_loader is not None and (epoch % max(1, args.eval_interval) == 0):
 			eval_em, error_counter, eval_stats = evaluate_epoch(
-				model=model,
+				model=eval_model,
 				eval_loader=eval_loader,
 				tokenizer=tokenizer,
 				device=device,
@@ -965,7 +999,9 @@ def main() -> None:
 
 		ckpt_payload: Dict[str, object] = {
 			"epoch": epoch,
-			"model": model.state_dict(),
+			"model": eval_model.state_dict(),
+			"model_raw": model.state_dict(),
+			"ema_model": ema_model.state_dict() if ema_model is not None else None,
 			"optimizer": optimizer.state_dict(),
 			"scheduler": scheduler.state_dict(),
 			"best_loss": best_loss,

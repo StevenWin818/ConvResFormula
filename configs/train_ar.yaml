@@ -13,13 +13,13 @@ training:
   num_workers: 4 # 训练 DataLoader 线程数
   epochs: 20 # 总训练轮数
   seed: 42 # 随机种子
-  mix_ratio: [0, 0, 0, 1] # 多数据源采样比例，手写:合成:单字符:wiki
-  epoch_samples: 314000 # 每个 epoch 的采样总数，<=0 表示全量
+  mix_ratio: [6, 2, 1, 2] # 多数据源采样比例，手写:合成:单字符:wiki
+  epoch_samples: 393216 # 每个 epoch 的采样总数，<=0 表示全量
   bucket_mega_factor: 30 # 分桶 mega-batch 系数
 
 optimization:
-  encoder_lr: 5.0e-5 # 编码器学习率
-  decoder_lr: 1.0e-4 # 解码器学习率
+  encoder_lr: 3.0e-5 # 编码器学习率
+  decoder_lr: 1.0e-5 # 解码器学习率
   weight_decay: 1.0e-2 # AdamW 权重衰减
   label_smoothing: 0.1 # 交叉熵标签平滑，提升泛化能力
 
@@ -35,14 +35,14 @@ eval:
   eval_interval: 1 # 每隔多少个 epoch 评估一次
   batch_size: 32 # 评估 batch 大小
   num_workers: 2 # 评估 DataLoader 线程数
-  samples: 1500 # 每轮评估抽样数量，<=0 表示全量
+  samples: 1024 # 每轮评估抽样数量，<=0 表示全量
   max_len: 160 # 评估解码最大长度
   skip_eval: false # 是否跳过训练期评估
 
 runtime:
   ckpt_dir: checkpoints/ar # checkpoint 输出目录
   log_dir: logs/ar_logs # 日志输出目录
-  resume_ckpt: checkpoints/ar/latest.pth # 恢复训练使用的 checkpoint
+  resume_ckpt: checkpoints\ar\epoch_10.pth # 恢复训练使用的 checkpoint
   resume: True # 是否默认启用断点恢复
   amp_dtype: fp16 # 训练精度类型(fp16/bf16/fp32)
   cudnn_benchmark: False # 必须禁用
