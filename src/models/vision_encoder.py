@@ -58,7 +58,14 @@ class ConvNeXtV2Encoder(nn.Module):
     基于 ConvNeXt-V2 的 2D 视觉主干网络。
     支持灰度图(in_chans=1)输入，输出展平后的序列 [Batch, Seq_Len, d_model]
     """
-    def __init__(self, model_name: str = 'convnextv2_pico', pretrained: bool = True, d_model: int = 512, in_chans: int = 1):
+    def __init__(
+        self, 
+        model_name: str = 'convnextv2_pico', 
+        pretrained: bool = True, 
+        d_model: int = 512, 
+        in_chans: int = 1,
+        drop_path_rate: float = 0.0, # 接收参数，默认为0保持向后兼容
+    ):
         super().__init__()
         
         # 1. 使用 timm 拉取预训练骨干网络
@@ -69,7 +76,8 @@ class ConvNeXtV2Encoder(nn.Module):
             pretrained=pretrained,
             in_chans=in_chans,    # 直接支持单通道灰度图！timm会自动处理预训练权重的合并
             features_only=True,
-            out_indices=(-1,)     # 只取最后一次下采样（32倍）的特征图
+            out_indices=(-1,),     # 只取最后一次下采样（32倍）的特征图
+            drop_path_rate=drop_path_rate,  # 传递 drop_path_rate 参数
         )
         
         # 获取 ConvNeXt 最后一层的输出通道数 (pico 是 512, nano 是 640)

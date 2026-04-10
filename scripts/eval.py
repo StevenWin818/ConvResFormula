@@ -150,6 +150,13 @@ def build_model(checkpoint_path: str, tokenizer: Tokenizer, d_model: int, device
 
 	checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 	state_dict = checkpoint.get("model", checkpoint)
+	if isinstance(state_dict, dict):
+		orig_prefix = "_orig_mod."
+		if any(str(k).startswith(orig_prefix) for k in state_dict.keys()):
+			state_dict = {
+				(str(k)[len(orig_prefix):] if str(k).startswith(orig_prefix) else str(k)): v
+				for k, v in state_dict.items()
+			}
 	state_dict = convert_legacy_attnres_state_dict(state_dict)
 	model.load_state_dict(state_dict, strict=True)
 	model.eval()

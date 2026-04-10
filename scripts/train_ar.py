@@ -895,6 +895,11 @@ def main() -> None:
 	if ema_model is None:
 		ema_model = AveragedModel(model, multi_avg_fn=ema_avg_fn)
 
+	eval_model_for_ckpt = cast(LatexOCRModel, ema_model.module if ema_model is not None else model)
+	eval_model = eval_model_for_ckpt
+	if hasattr(torch, "compile"):
+		eval_model = cast(LatexOCRModel, torch.compile(eval_model))
+
 	trainer = ARTrainer(
 		model=model,
 		optimizer=optimizer,
@@ -946,7 +951,6 @@ def main() -> None:
 	for epoch in range(start_epoch, args.epochs + 1):
 		train_batch_sampler.set_epoch(epoch)
 		avg_loss, avg_acc = trainer.train_epoch(train_loader, epoch=epoch, log_interval=args.log_interval)
-		eval_model = cast(LatexOCRModel, ema_model.module if ema_model is not None else model)
 
 		eval_processed = 0.0
 		eval_exact = 0.0
@@ -999,7 +1003,7 @@ def main() -> None:
 
 		ckpt_payload: Dict[str, object] = {
 			"epoch": epoch,
-			"model": eval_model.state_dict(),
+			"model": eval_model_for_ckpt.state_dict(),
 			"model_raw": model.state_dict(),
 			"ema_model": ema_model.state_dict() if ema_model is not None else None,
 			"optimizer": optimizer.state_dict(),

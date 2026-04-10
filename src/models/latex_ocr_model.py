@@ -39,6 +39,7 @@ class LatexOCRModel(nn.Module):
         vision_model_name: str = "convnextv2_pico",
         vision_pretrained: bool = True,
         vision_in_chans: int = 1,
+        vision_drop_path_rate: float = 0.0,
         decoder_nhead: int = 8,
         decoder_num_layers: int = 4,
         decoder_dim_feedforward: int = 2048,
@@ -54,6 +55,7 @@ class LatexOCRModel(nn.Module):
             pretrained=vision_pretrained,
             d_model=d_model, 
             in_chans=vision_in_chans,
+            drop_path_rate=vision_drop_path_rate
         )
         
         # 2. 文本词表 Embedding 与位置编码
