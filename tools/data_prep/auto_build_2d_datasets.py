@@ -249,7 +249,7 @@ if __name__ == "__main__":
          
         ("单字符集 (Symbols)", 
          r"C:\Projects\LatexProject\datasets\symbols.h5", 
-         r"C:\Projects\LatexProject\ConvResFormula\datasets\symbols.h5", DEFAULT_TARGET_H),
+         r"C:\Projects\LatexProject\ConvResFormula\datasets\symbols96.h5", DEFAULT_TARGET_H),
     ]
 
     for name, src, dst, target_h in DATASETS_TO_BUILD:

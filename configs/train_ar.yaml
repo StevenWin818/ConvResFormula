@@ -6,20 +6,20 @@ data:
     - C:/Projects/LatexProject/ConvResFormula/datasets/wiki_train_314k.h5 # wiki训练集
   eval_h5: C:/Projects/LatexProject/ConvResFormula/datasets/val96.h5 # 验证/评估集
   tokenizer: C:/Projects/LatexProject/ConvResFormula/tokenizer_bpe.json # BPE 分词器
-  max_area: 98304 # 图像动态缩放的面积上限
+  max_area: 73728 # 图像动态缩放的面积上限
 
 training:
-  batch_size: 24 # 训练 batch 大小
+  batch_size: 16 # 训练 batch 大小
   num_workers: 4 # 训练 DataLoader 线程数
   epochs: 40 # 总训练轮数
   seed: 42 # 随机种子
-  mix_ratio: [6, 4, 1, 1] # 多数据源采样比例，手写:合成:单字符:wiki
-  epoch_samples: 393216 # 每个 epoch 的采样总数，<=0 表示全量
-  bucket_mega_factor: 30 # 分桶 mega-batch 系数
+  mix_ratio: [0, 0, 0, 1] # 多数据源采样比例，手写:合成:单字符:wiki
+  epoch_samples: 318984 # 每个 epoch 的采样总数，<=0 表示全量
+  bucket_mega_factor: 64 # 分桶 mega-batch 系数
 
 optimization:
-  encoder_lr: 4.0e-5 # 编码器学习率
-  decoder_lr: 1.0e-5 # 解码器学习率
+  encoder_lr: 7.0e-5 # 编码器学习率
+  decoder_lr: 1.0e-4 # 解码器学习率
   weight_decay: 1.0e-2 # AdamW 权重衰减
   label_smoothing: 0.1 # 交叉熵标签平滑，提升泛化能力
 
