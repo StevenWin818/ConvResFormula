@@ -79,6 +79,11 @@ class ConvNeXtV2Encoder(nn.Module):
             out_indices=(-1,),     # 只取最后一次下采样（32倍）的特征图
             drop_path_rate=drop_path_rate,  # 传递 drop_path_rate 参数
         )
+
+        # 核心修复：启用 timm 原生细粒度梯度检查点（Stage/Layer 内部分段释放）
+        if hasattr(self.backbone, "set_grad_checkpointing"):
+            self.backbone.set_grad_checkpointing(True)
+            print("✅ 视觉主干网络内部 Layer-level 梯度检查点已激活！")
         
         # 获取 ConvNeXt 最后一层的输出通道数 (pico 是 512, nano 是 640)
         # 强制转换为 int 来消除 Pylance 的类型推断噪音

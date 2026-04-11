@@ -9,7 +9,7 @@ data:
   max_area: 98304 # 图像动态缩放的面积上限
 
 training:
-  batch_size: 16 # 训练 batch 大小
+  batch_size: 24 # 训练 batch 大小
   num_workers: 4 # 训练 DataLoader 线程数
   epochs: 40 # 总训练轮数
   seed: 42 # 随机种子
