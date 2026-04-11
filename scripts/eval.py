@@ -584,6 +584,7 @@ def evaluate(args: argparse.Namespace) -> Tuple[float, float, int]:
 			persistent_workers=(args.num_workers > 0),
 		)
 		model = build_model(args.checkpoint, tokenizer, args.d_model, device)
+		tf_model = cast(LatexOCRModel, getattr(model, "_orig_mod", model))
 		amp_enabled = device.type == "cuda"
 
 		max_samples = len(dataset) if args.max_samples <= 0 else min(args.max_samples, len(dataset))
@@ -595,6 +596,10 @@ def evaluate(args: argparse.Namespace) -> Tuple[float, float, int]:
 		text_exact_match = 0
 		total_ed = 0
 		total_ned = 0.0
+		total_token_correct = 0
+		total_token_count = 0
+		tf_token_correct = 0
+		tf_token_count = 0
 		mismatch_counter: Counter[str] = Counter()
 		report_rows: List[str] = []
 
@@ -605,6 +610,17 @@ def evaluate(args: argparse.Namespace) -> Tuple[float, float, int]:
 
 			images = batch["images"].to(device)
 			target_ids = batch["target_ids"]
+
+			# 训练口径 TokenAcc（Teacher-Forcing）：GT 前缀喂入，比较 next-token。
+			tf_inputs = target_ids[:, :-1].to(device)
+			tf_targets = target_ids[:, 1:].to(device)
+			with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled):
+				tf_logits = tf_model(images=images, tgt_seq=tf_inputs, is_causal=True)
+			tf_preds = tf_logits.argmax(dim=-1)
+			tf_valid_mask = tf_targets != pad_id
+			if tf_valid_mask.any():
+				tf_token_correct += int((tf_preds[tf_valid_mask] == tf_targets[tf_valid_mask]).sum().item())
+				tf_token_count += int(tf_valid_mask.sum().item())
 
 			pred_batch = batched_infer_ar(
 				model=model,
@@ -622,6 +638,28 @@ def evaluate(args: argparse.Namespace) -> Tuple[float, float, int]:
 
 				pred_text = tokenizer.decode(pred_batch[i], skip_special_tokens=True).strip()
 				target_text = tokenizer.decode(target_ids[i].tolist(), skip_special_tokens=True).strip()
+
+				# 评估期 TokenAcc：与训练口径对齐，比较 next-token 序列（去 BOS，保留 EOS）。
+				target_row = target_ids[i].tolist()
+				if pad_id in target_row:
+					target_row = target_row[: target_row.index(pad_id)]
+				target_eval_tokens = target_row[1:] if target_row and target_row[0] == bos_id else target_row
+
+				pred_row = list(pred_batch[i])
+				if pred_row and pred_row[0] == bos_id:
+					pred_row = pred_row[1:]
+				if eos_id in pred_row:
+					pred_eval_tokens = pred_row[: pred_row.index(eos_id) + 1]
+				else:
+					pred_eval_tokens = pred_row + [eos_id]
+				if target_eval_tokens:
+					sample_total = len(target_eval_tokens)
+					sample_correct = 0
+					for pos, tgt_tok in enumerate(target_eval_tokens):
+						if pos < len(pred_eval_tokens) and pred_eval_tokens[pos] == tgt_tok:
+							sample_correct += 1
+					total_token_correct += sample_correct
+					total_token_count += sample_total
 
 				is_correct = check_visual_equivalence(target_text, pred_text, svg_renderer)
 				text_exact_match += int(pred_text == target_text)
@@ -651,6 +689,8 @@ def evaluate(args: argparse.Namespace) -> Tuple[float, float, int]:
 
 		em_rate = exact_match / processed
 		text_em_rate = text_exact_match / processed
+		token_acc_rate = (total_token_correct / total_token_count) if total_token_count > 0 else 0.0
+		tf_token_acc_rate = (tf_token_correct / tf_token_count) if tf_token_count > 0 else 0.0
 		avg_ed = total_ed / processed
 		avg_ned = total_ned / processed
 
@@ -671,6 +711,8 @@ def evaluate(args: argparse.Namespace) -> Tuple[float, float, int]:
 			f.write(f"EvalRenderEM(%): {em_rate * 100:.4f}\n")
 			f.write(f"EvalTextExact: {text_exact_match}\n")
 			f.write(f"EvalTextEM(%): {text_em_rate * 100:.4f}\n")
+			f.write(f"EvalTokenAcc(%): {token_acc_rate * 100:.4f}\n")
+			f.write(f"EvalTFTokenAcc(%): {tf_token_acc_rate * 100:.4f}\n")
 			f.write(f"EvalNED: {avg_ned:.6f}\n")
 			f.write(f"AvgED: {avg_ed:.4f}\n\n")
 
@@ -693,9 +735,11 @@ def evaluate(args: argparse.Namespace) -> Tuple[float, float, int]:
 		print(f"EvalRenderEM(%) : {em_rate * 100:.4f}")
 		print(f"EvalTextExact   : {text_exact_match}")
 		print(f"EvalTextEM(%)   : {text_em_rate * 100:.4f}")
+		print(f"EvalTokenAcc(%) : {token_acc_rate * 100:.4f}")
+		print(f"EvalTFTokenAcc(%): {tf_token_acc_rate * 100:.4f}")
 		print("VisualRule      : normalize -> svg_dom -> path_signature")
 		print(f"SVGNodeScript   : {svg_node_script}")
-		print(f"EvalNED       : {avg_ned:.6f}")
+		print(f"EvalNED       : {avg_ned:.6f}") 
 		print(f"AvgED         : {avg_ed:.4f}")
 		print(f"Report        : {report_path}")
 		print(f"TopErrors     : {top_error_path}")

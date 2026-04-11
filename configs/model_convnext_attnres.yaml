@@ -1,14 +1,16 @@
 model:
-  d_model: 512
+  d_model: 256
+  use_learned_position_embeddings: true
+  max_position_embeddings: 2048
 
 vision_encoder:
-  model_name: convnextv2_pico
+  model_name: convnextv2_nano
   pretrained: true
   in_chans: 1
   drop_path_rate: 0.1
 
 text_decoder:
   nhead: 8
-  num_layers: 4
+  num_layers: 6
   dim_feedforward: 2048
   dropout: 0.1

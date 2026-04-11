@@ -9,45 +9,28 @@ from typing import Optional, Tuple
 from .vision_encoder import ConvNeXtV2Encoder
 from .text_decoder import AttnResDecodeCache, AttnResTextDecoder
 
-class PositionalEncoding1D(nn.Module):
-    """标准的 1D 文本序列位置编码"""
-    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 1000):
-        super().__init__()
-        self.dropout = nn.Dropout(p=dropout)
-        position = torch.arange(max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2) * (-math.log(10000.0) / d_model))
-        pe = torch.zeros(max_len, 1, d_model)
-        pe[:, 0, 0::2] = torch.sin(position * div_term)
-        pe[:, 0, 1::2] = torch.cos(position * div_term)
-        # 转为 [1, max_len, d_model] 适应 batch_first
-        self.register_buffer('pe', pe.transpose(0, 1))
-        self.pe: torch.Tensor
-
-    def forward(self, x: torch.Tensor, start_pos: int = 0) -> torch.Tensor:
-        """x: [Batch, SeqLen, d_model]"""
-        seq_len = x.size(1)
-        x = x + self.pe[:, start_pos:start_pos + seq_len, :]
-        return self.dropout(x)
-
-
 class LatexOCRModel(nn.Module):
     def __init__(
         self,
         vocab_size: int,
-        d_model: int = 512,
+        d_model: int = 256,
         pad_id: int = 0,
-        vision_model_name: str = "convnextv2_pico",
+        vision_model_name: str = "convnextv2_nano",
         vision_pretrained: bool = True,
         vision_in_chans: int = 1,
         vision_drop_path_rate: float = 0.0,
         decoder_nhead: int = 8,
-        decoder_num_layers: int = 4,
+        decoder_num_layers: int = 6,
         decoder_dim_feedforward: int = 2048,
         decoder_dropout: float = 0.1,
+        use_learned_position_embeddings: bool = True,
+        max_position_embeddings: int = 2048,
     ):
         super().__init__()
         self.d_model = d_model
         self.pad_id = pad_id
+        self.use_learned_position_embeddings = use_learned_position_embeddings
+        self.max_position_embeddings = max_position_embeddings
         
         # 1. 2D 视觉主干
         self.encoder = ConvNeXtV2Encoder(
@@ -60,7 +43,7 @@ class LatexOCRModel(nn.Module):
         
         # 2. 文本词表 Embedding 与位置编码
         self.text_embedding = nn.Embedding(vocab_size, d_model, padding_idx=pad_id)
-        self.text_pos_enc = PositionalEncoding1D(d_model=d_model, dropout=0.1)
+        self.text_pos_embedding = nn.Embedding(max_position_embeddings, d_model)
         
         # 3. 语言大脑：AttnRes 解码器
         self.decoder = AttnResTextDecoder(
@@ -73,6 +56,22 @@ class LatexOCRModel(nn.Module):
         
         # 4. 预测分类头
         self.head = nn.Linear(d_model, vocab_size)
+
+    def _apply_position_embeddings(self, x: torch.Tensor, start_pos: int = 0) -> torch.Tensor:
+        """为文本特征注入 learned position embeddings。"""
+        if not self.use_learned_position_embeddings:
+            return x
+
+        seq_len = x.size(1)
+        end_pos = start_pos + seq_len
+        if end_pos > self.max_position_embeddings:
+            raise ValueError(
+                f"位置索引越界: end_pos={end_pos}, max_position_embeddings={self.max_position_embeddings}"
+            )
+
+        positions = torch.arange(start_pos, end_pos, device=x.device, dtype=torch.long)
+        pos_emb = self.text_pos_embedding(positions).unsqueeze(0)
+        return x + pos_emb
 
     def generate_causal_mask(self, sz: int, device: torch.device) -> torch.Tensor:
         """生成用于自回归分支的下三角因果掩码"""
@@ -102,7 +101,7 @@ class LatexOCRModel(nn.Module):
         """自回归循环运行的大脑"""
         tgt_key_padding_mask = (tgt_seq == self.pad_id)
         tgt_emb = self.text_embedding(tgt_seq) * math.sqrt(self.d_model)
-        tgt_emb = self.text_pos_enc(tgt_emb)
+        tgt_emb = self._apply_position_embeddings(tgt_emb, start_pos=0)
 
         seq_len = tgt_seq.size(1)
         tgt_mask = self.generate_causal_mask(seq_len, tgt_seq.device) if is_causal else None
@@ -137,7 +136,7 @@ class LatexOCRModel(nn.Module):
             start_pos = 0
 
         tgt_emb = self.text_embedding(token_id) * math.sqrt(self.d_model)
-        tgt_emb = self.text_pos_enc(tgt_emb, start_pos=start_pos)
+        tgt_emb = self._apply_position_embeddings(tgt_emb, start_pos=start_pos)
 
         if precomputed_cross_kvs is None:
             precomputed_cross_kvs = self.precompute_cross_kv(memory)
@@ -171,7 +170,7 @@ class LatexOCRModel(nn.Module):
             start_pos = 0
 
         tgt_emb = self.text_embedding(token_id) * math.sqrt(self.d_model)
-        tgt_emb = self.text_pos_enc(tgt_emb, start_pos=start_pos)
+        tgt_emb = self._apply_position_embeddings(tgt_emb, start_pos=start_pos)
 
         decoder_out, new_cache = self.decoder.forward_step_cached(
             text_embeddings=tgt_emb,

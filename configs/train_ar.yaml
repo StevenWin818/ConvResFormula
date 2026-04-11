@@ -1,10 +1,10 @@
 data:
   train_h5:
-    - C:/Projects/LatexProject/ConvResFormula/datasets/train.h5 # 手写训练集
-    - C:/Projects/LatexProject/ConvResFormula/datasets/synthetic.h5 # 合成训练集
-    - C:/Projects/LatexProject/ConvResFormula/datasets/symbols.h5 # 单字符训练集
+    - C:/Projects/LatexProject/ConvResFormula/datasets/train96.h5 # 手写训练集
+    - C:/Projects/LatexProject/ConvResFormula/datasets/synthetic96.h5 # 合成训练集
+    - C:/Projects/LatexProject/ConvResFormula/datasets/symbols96.h5 # 单字符训练集
     - C:/Projects/LatexProject/ConvResFormula/datasets/wiki_train_314k.h5 # wiki训练集
-  eval_h5: C:/Projects/LatexProject/ConvResFormula/datasets/val.h5 # 验证/评估集
+  eval_h5: C:/Projects/LatexProject/ConvResFormula/datasets/val96.h5 # 验证/评估集
   tokenizer: C:/Projects/LatexProject/ConvResFormula/tokenizer_bpe.json # BPE 分词器
   max_area: 98304 # 图像动态缩放的面积上限
 

@@ -121,7 +121,7 @@ def pad_to_stride(image: np.ndarray, stride: int = 32, min_size: int = 32) -> np
 # 主流处理管道
 # ==========================================
 
-def build_dataset(name: str, source_h5: str, target_h5: str, tokenizer: Tokenizer, target_h: int = 128):
+def build_dataset(name: str, source_h5: str, target_h5: str, tokenizer: Tokenizer, target_h: int = 96):
     print(f"\n" + "="*50)
     print(f"· 开始构建数据集: {name}")
     print(f"· 来源: {source_h5}")
@@ -231,21 +231,21 @@ if __name__ == "__main__":
     print(f"· 正在加载 BPE Tokenizer: {TOKENIZER_PATH}")
     tokenizer = Tokenizer.from_file(TOKENIZER_PATH)
 
-    DEFAULT_TARGET_H = 128
+    DEFAULT_TARGET_H = 96
 
     # === 2. 配置数据集  ===
     DATASETS_TO_BUILD = [
         ("手写训练集 (Train)", 
          r"C:\Projects\LatexProject\datasets\train.h5", 
-         r"C:\Projects\LatexProject\ConvResFormula\datasets\train.h5", DEFAULT_TARGET_H),
+         r"C:\Projects\LatexProject\ConvResFormula\datasets\train96.h5", DEFAULT_TARGET_H),
          
         ("手写验证集 (Val)", 
          r"C:\Projects\LatexProject\datasets\val.h5", 
-         r"C:\Projects\LatexProject\ConvResFormula\datasets\val.h5", DEFAULT_TARGET_H),
+         r"C:\Projects\LatexProject\ConvResFormula\datasets\val96.h5", DEFAULT_TARGET_H),
          
         ("合成长公式 (Synthetic)", 
          r"C:\Projects\LatexProject\datasets\synthetic.h5", 
-         r"C:\Projects\LatexProject\ConvResFormula\datasets\synthetic.h5", DEFAULT_TARGET_H),
+         r"C:\Projects\LatexProject\ConvResFormula\datasets\synthetic96.h5", DEFAULT_TARGET_H),
          
         ("单字符集 (Symbols)", 
          r"C:\Projects\LatexProject\datasets\symbols.h5", 
