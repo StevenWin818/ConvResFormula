@@ -46,7 +46,7 @@ runtime:
   resume: True # 是否默认启用断点恢复
   amp_dtype: fp16 # 训练精度类型(fp16/bf16/fp32)
   cudnn_benchmark: False # 必须禁用
-  channels_last: True # 启用 channels_last 内存格式
+  channels_last: False # 启用 channels_last 内存格式
   use_gradient_checkpointing: true # 启用梯度检查点以降低显存占用（会增加计算时间）
   kernel_warmup_batches: 2 # 训练前预热批次数，过大可能显著拉长首轮启动
 
