@@ -56,3 +56,5 @@ pip-wheel-metadata/
 *.code-workspace
 .gemini/
 .github/copilot-instructions.md
+
+node_modules
