@@ -86,6 +86,20 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--eval_max_len", type=int, default=None, help=h("eval_max_len", "评估解码最大长度"))
 	parser.add_argument("--amp_dtype", type=str, choices=["fp16", "bf16", "fp32"], default=None, help=h("amp_dtype", "训练精度类型: fp16 / bf16 / fp32"))
 
+	parser.add_argument("--use_gradient_checkpointing", dest="use_gradient_checkpointing", action="store_true", 
+		help="启用梯度检查点以降低显存占用（会增加计算时间）")
+	parser.add_argument("--no_gradient_checkpointing", dest="use_gradient_checkpointing", action="store_false", 
+		help="禁用梯度检查点")
+	parser.set_defaults(use_gradient_checkpointing=None)
+
+	parser.add_argument("--checkpoint_segments", type=int, default=None, 
+		help="对视觉编码器分成多少段应用检查点 (1=整体, 2=前后层, 4=四分段)")
+	parser.add_argument("--checkpoint_decoder_layers", dest="checkpoint_decoder_layers", action="store_true",
+		help="对文本解码器层应用梯度检查点")
+	parser.add_argument("--no_checkpoint_decoder", dest="checkpoint_decoder_layers", action="store_false",
+		help="禁用解码器层检查点")
+	parser.set_defaults(checkpoint_decoder_layers=None)
+
 	eval_group = parser.add_mutually_exclusive_group()
 	eval_group.add_argument("--skip_eval", dest="skip_eval", action="store_true", help=h("skip_eval", "仅训练不做评估"))
 	eval_group.add_argument("--enable_eval", dest="skip_eval", action="store_false", help=h("enable_eval", "启用训练期评估"))
@@ -205,6 +219,11 @@ def apply_config_defaults(args: argparse.Namespace, train_cfg: Dict[str, Any], m
 	args.cudnn_benchmark = bool(_cfg_get(train_cfg, ("runtime", "cudnn_benchmark"), False))
 	if args.channels_last is None:
 		args.channels_last = bool(_cfg_get(train_cfg, ("runtime", "channels_last"), False))
+	if args.use_gradient_checkpointing is None:
+		args.use_gradient_checkpointing = bool(_cfg_get(train_cfg, ("runtime", "use_gradient_checkpointing"), False))
+	args.checkpoint_segments = args.checkpoint_segments if args.checkpoint_segments is not None else int(_cfg_get(train_cfg, ("model", "checkpoint_segments"), 1))
+	if args.checkpoint_decoder_layers is None:
+		args.checkpoint_decoder_layers = bool(_cfg_get(train_cfg, ("model", "checkpoint_decoder_layers"), False))
 	args.kernel_warmup_batches = int(_cfg_get(train_cfg, ("runtime", "kernel_warmup_batches"), 8))
     
 	if args.kernel_warmup_batches < 0:
@@ -814,7 +833,16 @@ def main() -> None:
 			persistent_workers=(args.eval_num_workers > 0),
 		)
 
-	model = LatexOCRModel(vocab_size=vocab_size, d_model=args.d_model, pad_id=pad_id).to(device)
+	model = LatexOCRModel(
+		vocab_size=vocab_size, 
+		d_model=args.d_model, 
+		pad_id=pad_id,
+		use_gradient_checkpointing=args.use_gradient_checkpointing,
+		checkpoint_segments=args.checkpoint_segments if args.checkpoint_segments is not None else 1,
+		checkpoint_decoder_layers=args.checkpoint_decoder_layers if args.checkpoint_decoder_layers is not None else False,
+	).to(device)
+	if args.channels_last:
+		model = model.to(memory_format=torch.channels_last) # type: ignore
 	optimizer = build_optimizer(
 		model=model,
 		encoder_lr=args.encoder_lr,
@@ -1020,7 +1048,7 @@ def main() -> None:
 			"epoch": epoch,
 			"model": eval_model_for_ckpt.state_dict(),
 			"model_raw": model.state_dict(),
-			"ema_model": ema_model.state_dict() if ema_model is not None else None,
+			# "ema_model": ema_model.state_dict() if ema_model is not None else None,
 			"optimizer": optimizer.state_dict(),
 			"scheduler": scheduler.state_dict(),
 			"best_loss": best_loss,

@@ -4,6 +4,7 @@ LaTeX OCR 主模型组装与 MLM 前向接口。
 import math
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 from typing import Optional, Tuple
 
 from .vision_encoder import ConvNeXtV2Encoder
@@ -25,12 +26,18 @@ class LatexOCRModel(nn.Module):
         decoder_dropout: float = 0.1,
         use_learned_position_embeddings: bool = True,
         max_position_embeddings: int = 2048,
+        use_gradient_checkpointing: bool = False,
+        checkpoint_segments: int = 1,
+        checkpoint_decoder_layers: bool = False,
     ):
         super().__init__()
         self.d_model = d_model
         self.pad_id = pad_id
         self.use_learned_position_embeddings = use_learned_position_embeddings
         self.max_position_embeddings = max_position_embeddings
+        self.use_gradient_checkpointing = bool(use_gradient_checkpointing)
+        self.checkpoint_segments = max(1, int(checkpoint_segments))
+        self.checkpoint_decoder_layers = bool(checkpoint_decoder_layers)
         
         # 1. 2D 视觉主干
         self.encoder = ConvNeXtV2Encoder(
@@ -181,7 +188,68 @@ class LatexOCRModel(nn.Module):
         logits = self.head(decoder_out.squeeze(1))
         return logits, new_cache
 
+    def _encode_checkpoint_wrapper(self, images: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """编码器 checkpoint 包装函数，用于梯度检查点。"""
+        return self.encoder(images)
+
+    def _decode_checkpoint_wrapper(
+        self,
+        tgt_emb: torch.Tensor,
+        memory: torch.Tensor,
+        tgt_mask: Optional[torch.Tensor],
+        tgt_key_padding_mask: torch.Tensor,
+        memory_key_padding_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """解码器 checkpoint 包装函数，用于梯度检查点。"""
+        return self.decoder(
+            text_embeddings=tgt_emb,
+            cross_features=memory,
+            tgt_mask=tgt_mask,
+            tgt_key_padding_mask=tgt_key_padding_mask,
+            memory_key_padding_mask=memory_key_padding_mask,
+        )
+
     def forward(self, images: torch.Tensor, tgt_seq: torch.Tensor, is_causal: bool = True) -> torch.Tensor:
-        """训练时使用的完整前向传播"""
-        memory, memory_padding_mask = self.encode(images)
-        return self.decode(memory, tgt_seq, memory_padding_mask, is_causal)
+        """训练时使用的完整前向传播，支持梯度检查点。"""
+        # 编码步骤（可选择应用 checkpoint）
+        if self.use_gradient_checkpointing and self.training:
+            output = checkpoint(
+                self._encode_checkpoint_wrapper,
+                images,
+                use_reentrant=False,
+            )
+            memory: torch.Tensor = output[0]  # type: ignore
+            memory_mask: torch.Tensor = output[1]  # type: ignore
+        else:
+            memory, memory_mask = self.encode(images)
+
+        # 解码步骤
+        tgt_key_padding_mask = (tgt_seq == self.pad_id)
+        tgt_emb = self.text_embedding(tgt_seq) * math.sqrt(self.d_model)
+        tgt_emb = self._apply_position_embeddings(tgt_emb, start_pos=0)
+
+        seq_len = tgt_seq.size(1)
+        tgt_mask = self.generate_causal_mask(seq_len, tgt_seq.device) if is_causal else None
+
+        if self.use_gradient_checkpointing and self.training and self.checkpoint_decoder_layers:
+            # 对解码器应用 checkpoint
+            decoder_out = checkpoint(
+                self._decode_checkpoint_wrapper,
+                tgt_emb,
+                memory,
+                tgt_mask,
+                tgt_key_padding_mask,
+                memory_mask,
+                use_reentrant=False,
+            )
+        else:
+            decoder_out = self.decoder(
+                text_embeddings=tgt_emb,
+                cross_features=memory,
+                tgt_mask=tgt_mask,
+                tgt_key_padding_mask=tgt_key_padding_mask,
+                memory_key_padding_mask=memory_mask,
+            )
+
+        logits = self.head(decoder_out)
+        return logits

@@ -37,16 +37,17 @@ eval:
   num_workers: 2 # 评估 DataLoader 线程数
   samples: 1024 # 每轮评估抽样数量，<=0 表示全量
   max_len: 160 # 评估解码最大长度
-  skip_eval: false # 是否跳过训练期评估
+  skip_eval: True # 是否跳过训练期评估
 
 runtime:
   ckpt_dir: checkpoints/ar # checkpoint 输出目录
   log_dir: logs/ar_logs # 日志输出目录
-  resume_ckpt: checkpoints\ar\epoch_4.pth # 恢复训练使用的 checkpoint
+  resume_ckpt: checkpoints\ar\epoch_1.pth # 恢复训练使用的 checkpoint
   resume: True # 是否默认启用断点恢复
-  amp_dtype: bf16 # 训练精度类型(fp16/bf16/fp32)
+  amp_dtype: fp16 # 训练精度类型(fp16/bf16/fp32)
   cudnn_benchmark: False # 必须禁用
   channels_last: True # 启用 channels_last 内存格式
+  use_gradient_checkpointing: true # 启用梯度检查点以降低显存占用（会增加计算时间）
   kernel_warmup_batches: 2 # 训练前预热批次数，过大可能显著拉长首轮启动
 
 cli_help:
