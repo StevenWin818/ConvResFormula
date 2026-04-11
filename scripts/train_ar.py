@@ -94,6 +94,9 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--ckpt_dir", type=str, default=None, help=h("ckpt_dir", "checkpoint 输出目录"))
 	parser.add_argument("--log_dir", type=str, default=None, help=h("log_dir", "日志输出目录"))
 	parser.add_argument("--resume_ckpt", type=str, default=None, help=h("resume_ckpt", "恢复训练的 checkpoint 路径"))
+	parser.add_argument("--channels_last", dest="channels_last", action="store_true", help="启用 channels_last 内存格式")
+	parser.add_argument("--contiguous_format", dest="channels_last", action="store_false", help="禁用 channels_last，使用 contiguous 格式")
+	parser.set_defaults(channels_last=None)
 
 	resume_group = parser.add_mutually_exclusive_group()
 	resume_group.add_argument("--resume", dest="resume", action="store_true", help=h("resume", "从 resume_ckpt 恢复完整训练状态"))
@@ -200,6 +203,8 @@ def apply_config_defaults(args: argparse.Namespace, train_cfg: Dict[str, Any], m
 	args.log_dir = args.log_dir or str(_cfg_get(train_cfg, ("runtime", "log_dir"), r"logs\ar_logs"))
 	args.resume_ckpt = args.resume_ckpt or str(_cfg_get(train_cfg, ("runtime", "resume_ckpt"), r"checkpoints\ar\latest.pth"))
 	args.cudnn_benchmark = bool(_cfg_get(train_cfg, ("runtime", "cudnn_benchmark"), False))
+	if args.channels_last is None:
+		args.channels_last = bool(_cfg_get(train_cfg, ("runtime", "channels_last"), False))
 	args.kernel_warmup_batches = int(_cfg_get(train_cfg, ("runtime", "kernel_warmup_batches"), 8))
     
 	if args.kernel_warmup_batches < 0:
@@ -564,6 +569,7 @@ def evaluate_epoch(
 	device: torch.device,
 	amp_enabled: bool,
 	amp_dtype: torch.dtype,
+	channels_last: bool,
 	pad_id: int,
 	bos_id: int,
 	eos_id: int,
@@ -584,6 +590,8 @@ def evaluate_epoch(
 			break
 
 		images = batch["images"].to(device)
+		if channels_last and images.ndim == 4:
+			images = images.contiguous(memory_format=torch.channels_last)
 		target_ids = batch["target_ids"]
 
 		pred_batch = batched_infer_ar(
@@ -637,6 +645,7 @@ def warmup_kernel_cache(
 	device: torch.device,
 	amp_enabled: bool,
 	amp_dtype: torch.dtype,
+	channels_last: bool,
 	warmup_batches: int,
 ) -> int:
 	"""训练前执行少量前向预热，提前触发常见 shape 的内核/算法选择。"""
@@ -655,6 +664,8 @@ def warmup_kernel_cache(
 				break
 
 			images = batch["images"].to(device, non_blocking=True)
+			if channels_last and images.ndim == 4:
+				images = images.contiguous(memory_format=torch.channels_last)
 			if "decoder_inputs" in batch:
 				decoder_inputs = batch["decoder_inputs"].to(device, non_blocking=True)
 			else:
@@ -908,6 +919,7 @@ def main() -> None:
 		scaler=scaler,
 		amp_enabled=amp_enabled,
 		amp_dtype=amp_dtype,
+		channels_last=bool(args.channels_last),
 		label_smoothing=args.label_smoothing,
 		target_ignore_index=-100,
 		ema_model=ema_model,
@@ -929,6 +941,7 @@ def main() -> None:
 	print(
 		f"cudnn.benchmark={torch.backends.cudnn.benchmark} | "
 		f"cudnn.deterministic={torch.backends.cudnn.deterministic} | "
+		f"channels_last={bool(args.channels_last)} | "
 		f"KernelWarmupBatches={args.kernel_warmup_batches}"
 	)
 	if not args.skip_eval:
@@ -943,6 +956,7 @@ def main() -> None:
 		device=device,
 		amp_enabled=amp_enabled,
 		amp_dtype=amp_dtype,
+		channels_last=bool(args.channels_last),
 		warmup_batches=args.kernel_warmup_batches,
 	)
 	if warmed > 0:
@@ -966,6 +980,7 @@ def main() -> None:
 				device=device,
 				amp_enabled=amp_enabled,
 				amp_dtype=amp_dtype,
+				channels_last=bool(args.channels_last),
 				pad_id=pad_id,
 				bos_id=bos_id,
 				eos_id=eos_id,

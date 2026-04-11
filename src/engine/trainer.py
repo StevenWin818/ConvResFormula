@@ -17,6 +17,7 @@ class ARTrainer:
         scaler=None,
         amp_enabled=False,
         amp_dtype=torch.float16,
+        channels_last=False,
         label_smoothing=0.0,
         target_ignore_index=-100,
         ema_model=None,
@@ -39,6 +40,7 @@ class ARTrainer:
         self.scaler = scaler
         self.amp_enabled = bool(amp_enabled)
         self.amp_dtype = amp_dtype
+        self.channels_last = bool(channels_last)
         self.label_smoothing = float(label_smoothing)
         self.ema_model = ema_model
         if not (0.0 <= self.label_smoothing < 1.0):
@@ -134,6 +136,8 @@ class ARTrainer:
         pbar = tqdm(dataloader, desc=f"Epoch {epoch} [Train]")
         for batch_idx, batch in enumerate(pbar):
             images = batch["images"].to(self.device, non_blocking=True)
+            if self.channels_last and images.ndim == 4:
+                images = images.contiguous(memory_format=torch.channels_last)
 
             if "decoder_inputs" in batch and "labels" in batch:
                 ar_inputs = batch["decoder_inputs"].to(self.device, non_blocking=True)
