@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, cast
 
 import torch
+import yaml
 from tokenizers import Tokenizer
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
@@ -41,6 +42,211 @@ SVG_REF_ATTRS = {
 }
 SVG_URL_REF_PATTERN = re.compile(r"url\(\s*#([^\)]+)\s*\)")
 SVG_ONLY_HASH_REF_PATTERN = re.compile(r"^#.+$")
+OVER_PREFIX_COMMANDS = {
+	"\\overline",
+	"\\overbrace",
+	"\\overrightarrow",
+	"\\overleftarrow",
+	"\\overset",
+	"\\overgroup",
+	"\\overparen",
+	"\\overbracket",
+}
+TEXT_PRESERVE_COMMANDS = {
+	"\\text",
+	"\\operatorname",
+}
+
+
+def _is_escaped(text: str, idx: int) -> bool:
+	"""判断 text[idx] 是否被奇数个反斜杠转义。"""
+	backslashes = 0
+	j = idx - 1
+	while j >= 0 and text[j] == "\\":
+		backslashes += 1
+		j -= 1
+	return (backslashes % 2) == 1
+
+
+def _find_matching_brace(text: str, open_idx: int) -> int:
+	"""返回与 text[open_idx]=='{' 对应的闭合花括号位置，不存在则返回 -1。"""
+	if open_idx < 0 or open_idx >= len(text) or text[open_idx] != "{":
+		return -1
+
+	depth = 0
+	for i in range(open_idx, len(text)):
+		ch = text[i]
+		if ch == "{" and not _is_escaped(text, i):
+			depth += 1
+		elif ch == "}" and not _is_escaped(text, i):
+			depth -= 1
+			if depth == 0:
+				return i
+	return -1
+
+
+def _is_full_frac_expr(text: str) -> bool:
+	"""判断字符串是否完整且仅包含一个 \frac{...}{...} 表达式。"""
+	if not text.startswith("\\frac"):
+		return False
+
+	i = 5
+	if i >= len(text) or text[i] != "{":
+		return False
+	j = _find_matching_brace(text, i)
+	if j == -1:
+		return False
+
+	k = j + 1
+	if k >= len(text) or text[k] != "{":
+		return False
+	m = _find_matching_brace(text, k)
+	if m == -1:
+		return False
+
+	return m == len(text) - 1
+
+
+def _unwrap_wrapped_frac(tex: str) -> str:
+	"""将形如 {\frac{...}{...}} 的冗余外层花括号剥离。"""
+	out: List[str] = []
+	i = 0
+	while i < len(tex):
+		if tex[i] == "{" and not _is_escaped(tex, i):
+			j = _find_matching_brace(tex, i)
+			if j == -1:
+				out.append(tex[i:])
+				break
+
+			inner = tex[i + 1:j]
+			if _is_full_frac_expr(inner):
+				out.append(inner)
+			else:
+				out.append("{" + inner + "}")
+			i = j + 1
+			continue
+
+		out.append(tex[i])
+		i += 1
+
+	return "".join(out)
+
+
+def _unwrap_delimiter_wrapped_group(tex: str, left: str, right: str) -> str:
+	"""将 left{...}right 形式的冗余包裹改写为 left...right（支持嵌套花括号）。"""
+	out: List[str] = []
+	i = 0
+	while i < len(tex):
+		open_idx = i + len(left)
+		if tex.startswith(left + "{", i) and open_idx < len(tex) and tex[open_idx] == "{":
+			close_idx = _find_matching_brace(tex, open_idx)
+			if close_idx != -1 and tex.startswith(right, close_idx + 1):
+				inner = tex[open_idx + 1:close_idx]
+				out.append(left + inner + right)
+				i = close_idx + 1 + len(right)
+				continue
+
+		out.append(tex[i])
+		i += 1
+
+	return "".join(out)
+
+
+def _protect_text_like_groups(tex: str) -> Tuple[str, List[str]]:
+	"""保护 text-like 命令的花括号内容，避免全局空白剥离破坏可见文本。"""
+	protected: List[str] = []
+	out: List[str] = []
+	i = 0
+	while i < len(tex):
+		matched_cmd = None
+		for cmd in TEXT_PRESERVE_COMMANDS:
+			if tex.startswith(cmd, i):
+				matched_cmd = cmd
+				break
+
+		if matched_cmd is not None:
+			cmd_end = i + len(matched_cmd)
+			if cmd_end < len(tex) and tex[cmd_end] == "{":
+				close_idx = _find_matching_brace(tex, cmd_end)
+				if close_idx != -1:
+					placeholder = f"__TEXTLIKE_{len(protected)}__"
+					protected.append(tex[i:close_idx + 1])
+					out.append(placeholder)
+					i = close_idx + 1
+					continue
+
+		out.append(tex[i])
+		i += 1
+
+	return "".join(out), protected
+
+
+def _restore_text_like_groups(tex: str, protected: List[str]) -> str:
+	for idx, original in enumerate(protected):
+		tex = tex.replace(f"__TEXTLIKE_{idx}__", original)
+	return tex
+
+
+def _split_top_level_over(group_content: str) -> Optional[Tuple[str, str]]:
+	r"""在组内容顶层查找 \over，找到则返回左右两段。"""
+	depth = 0
+	i = 0
+	while i < len(group_content):
+		ch = group_content[i]
+		if ch == "{" and not _is_escaped(group_content, i):
+			depth += 1
+			i += 1
+			continue
+		if ch == "}" and not _is_escaped(group_content, i):
+			depth = max(0, depth - 1)
+			i += 1
+			continue
+
+		if depth == 0 and group_content.startswith("\\over", i):
+			if any(group_content.startswith(cmd, i) for cmd in OVER_PREFIX_COMMANDS):
+				i += 1
+				continue
+			next_idx = i + 5
+			left = group_content[:i]
+			right = group_content[next_idx:]
+			if left and right:
+				return left, right
+		i += 1
+
+	return None
+
+
+def _normalize_over_to_frac(tex: str) -> str:
+	r"""把任意层级的 {A\over B} 规范化为 \frac{A}{B}。"""
+	def _transform_segment(segment: str) -> str:
+		out: List[str] = []
+		i = 0
+		while i < len(segment):
+			if segment[i] == "{" and not _is_escaped(segment, i):
+				j = _find_matching_brace(segment, i)
+				if j == -1:
+					out.append(segment[i:])
+					break
+
+				inner = segment[i + 1:j]
+				inner = _transform_segment(inner)
+				over_parts = _split_top_level_over(inner)
+				if over_parts is not None:
+					num, den = over_parts
+					num = _transform_segment(num)
+					den = _transform_segment(den)
+					out.append(f"\\frac{{{num}}}{{{den}}}")
+				else:
+					out.append("{" + inner + "}")
+				i = j + 1
+				continue
+
+			out.append(segment[i])
+			i += 1
+
+		return "".join(out)
+
+	return _transform_segment(tex)
 
 
 def robust_normalize_tex(tex: str) -> str:
@@ -49,24 +255,25 @@ def robust_normalize_tex(tex: str) -> str:
 		return ""
 
 	tex = str(tex).strip()
+	tex, protected_text_groups = _protect_text_like_groups(tex)
 	
 	# 1. 优先剔除所有空白字符，方便后续无缝模式匹配
 	tex = re.sub(r"\s+", "", tex)
 
-	# 2. 剔除纯风格与排版控制宏
-	for macro in [r"\textstyle", r"\displaystyle", r"\scriptstyle", r"\scriptscriptstyle", r"\limits", r"\nolimits"]:
+	# 2. 仅剔除纯风格宏；保留 \limits/\nolimits 以避免抹平上下标布局差异
+	for macro in [r"\textstyle", r"\displaystyle", r"\scriptstyle", r"\scriptscriptstyle"]:
 		tex = tex.replace(macro, "")
 
-	# 3. 剔除 \left 和 \right
-	tex = tex.replace(r"\left", "").replace(r"\right", "")
+	# 3. 保留 \left 和 \right，避免大括号尺寸差异被错误归一
 
 	# 4. 剥离无意义的安全括号包裹 (处理类似 \gcd({S_{i}}) -> \gcd(S_{i}) 的问题)
 	# 循环执行 3 次以应对可能的嵌套包裹
 	for _ in range(3):
-		tex = tex.replace("({", "(").replace("})", ")")
-		tex = tex.replace("[{", "[").replace("}]", "]")
+		# 仅剥离“完整包裹”的冗余花括号，支持嵌套内容且不破坏合法结构。
+		tex = _unwrap_delimiter_wrapped_group(tex, "(", ")")
+		tex = _unwrap_delimiter_wrapped_group(tex, "[", "]")
+		tex = _unwrap_delimiter_wrapped_group(tex, "|", "|")
 		tex = tex.replace("\\{{", "\\{").replace("}\\}", "\\}")
-		tex = tex.replace("|{", "|").replace("}|", "|")
 		tex = tex.replace("_{}", "")  # 消除模型误生成的空下标
 		tex = tex.replace("^{}", "")  # 消除模型误生成的空上标
 
@@ -80,9 +287,9 @@ def robust_normalize_tex(tex: str) -> str:
 	tex = re.sub(r"\\ge(?![A-Za-z])", r"\\geq", tex)
 	tex = re.sub(r"\\ne(?![A-Za-z])", r"\\neq", tex)
 	tex = re.sub(r"\\rm(?![A-Za-z])", r"\\mathrm", tex)
-	tex = re.sub(r"\\text(?![A-Za-z])", r"\\mathrm", tex)
-	tex = re.sub(r"\\operatorname(?![A-Za-z])", r"\\mathrm", tex)
-	tex = re.sub(r"\{([^{}\\]+)\\over([^{}\\]+)\}", r"\\frac{\1}{\2}", tex)
+	tex = _normalize_over_to_frac(tex)
+	tex = _unwrap_wrapped_frac(tex)
+	tex = _restore_text_like_groups(tex, protected_text_groups)
 
 	return tex
 
@@ -233,7 +440,6 @@ def svg_path_signature(svg_text: str) -> Optional[Tuple[Tuple[str, Tuple[Tuple[s
 		"polyline",
 		"polygon",
 		"text",
-		"g",
 	}
 
 	for elem in root.iter():
@@ -255,7 +461,6 @@ def svg_path_signature(svg_text: str) -> Optional[Tuple[Tuple[str, Tuple[Tuple[s
 		text = re.sub(r"\s+", " ", elem.text or "").strip()
 		tokens.append((tag, tuple(attrs), text))
 
-	tokens.sort(key=lambda item: (item[0], item[1], item[2]))
 	return tuple(tokens)
 
 
@@ -271,6 +476,7 @@ def compare_svg_dom_and_paths(svg_a: str, svg_b: str) -> bool:
 	if canon_a is None or canon_b is None:
 		return False
 		
+	# 仅依赖严格规范化后的 DOM 比对，避免路径签名丢失结构信息导致误判。
 	return canon_a == canon_b
 
 class NodeKatexSvgRenderer:
@@ -377,14 +583,12 @@ class NodeKatexSvgRenderer:
 
 
 def check_visual_equivalence(gt_tex: str, pred_tex: str, svg_renderer: NodeKatexSvgRenderer) -> bool:
-	"""使用 KaTeX/Node 产出的 SVG 做 DOM 与路径双重比对。"""
+	"""使用 KaTeX/Node 产出的 SVG 做严格 DOM 一致性比对。"""
 	if not gt_tex or not pred_tex:
 		return gt_tex == pred_tex
 
 	norm_gt = robust_normalize_tex(gt_tex)
 	norm_pred = robust_normalize_tex(pred_tex)
-	if norm_gt == norm_pred:
-		return True
 
 	svg_gt = svg_renderer.render(norm_gt)
 	svg_pred = svg_renderer.render(norm_pred)
@@ -394,17 +598,29 @@ def check_visual_equivalence(gt_tex: str, pred_tex: str, svg_renderer: NodeKatex
 	return compare_svg_dom_and_paths(svg_gt, svg_pred)
 
 def parse_args() -> argparse.Namespace:
-	parser = argparse.ArgumentParser(description="AR 贪心解码评估脚本（SVG DOM/Path 一致性）")
+	parser = argparse.ArgumentParser(description="AR 贪心解码评估脚本（SVG DOM 严格一致性）")
 	parser.add_argument("--eval_h5", type=str, default=r"C:\Projects\LatexProject\ConvResFormula\datasets\val.h5")
 	parser.add_argument("--tokenizer", type=str, default=r"C:\Projects\LatexProject\ConvResFormula\tokenizer_bpe.json")
 	parser.add_argument("--checkpoint", type=str, default=r"checkpoints\ar\best.pth")
-	parser.add_argument("--d_model", type=int, default=512)
+	parser.add_argument("--train_config", type=str, default=str(PROJECT_ROOT / "configs" / "train_ar.yaml"))
+	parser.add_argument("--model_config", type=str, default=str(PROJECT_ROOT / "configs" / "model_convnext_attnres.yaml"))
+	parser.add_argument("--d_model", type=int, default=256)
 	parser.add_argument("--max_area", type=int, default=98304)
 	parser.add_argument("--batch_size", type=int, default=32)
 	parser.add_argument("--num_workers", type=int, default=4)
 	parser.add_argument("--max_len", type=int, default=160)
 	parser.add_argument("--max_samples", type=int, default=0, help="评估样本数上限，<=0 表示全量")
 	parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+	parser.add_argument("--amp_dtype", type=str, choices=["fp16", "bf16", "fp32"], default="bf16", help="评估精度类型")
+	parser.add_argument("--compile", dest="enable_compile", action="store_true", help="启用 torch.compile")
+	parser.add_argument("--no_compile", dest="enable_compile", action="store_false", help="禁用 torch.compile")
+	parser.set_defaults(enable_compile=False)
+	parser.add_argument("--use_gradient_checkpointing", dest="use_gradient_checkpointing", action="store_true", help="启用视觉主干梯度检查点")
+	parser.add_argument("--no_gradient_checkpointing", dest="use_gradient_checkpointing", action="store_false", help="禁用视觉主干梯度检查点")
+	parser.set_defaults(use_gradient_checkpointing=True)
+	parser.add_argument("--checkpoint_decoder_layers", dest="checkpoint_decoder_layers", action="store_true", help="启用解码器层梯度检查点")
+	parser.add_argument("--no_checkpoint_decoder", dest="checkpoint_decoder_layers", action="store_false", help="禁用解码器层梯度检查点")
+	parser.set_defaults(checkpoint_decoder_layers=None)
 	parser.add_argument("--report_dir", type=str, default=r"logs\ar_logs")
 	parser.add_argument("--log_interval", type=int, default=100)
 	parser.add_argument(
@@ -419,6 +635,36 @@ def parse_args() -> argparse.Namespace:
 		help="兼容旧参数，当前版本已停用该开关（始终使用本地 Node 依赖）",
 	)
 	return parser.parse_args()
+
+
+def _cfg_get(cfg: Dict[str, object], path: Tuple[str, ...], default: object = None) -> object:
+	cur: object = cfg
+	for key in path:
+		if not isinstance(cur, dict) or key not in cur:
+			return default
+		cur = cur[key]
+	return cur
+
+
+def _load_yaml_config(path: str) -> Dict[str, object]:
+	if not path or not os.path.exists(path):
+		return {}
+	with open(path, "r", encoding="utf-8") as f:
+		data = yaml.safe_load(f)
+	return data if isinstance(data, dict) else {}
+
+
+def resolve_eval_runtime_args(args: argparse.Namespace) -> None:
+	train_cfg = _load_yaml_config(args.train_config)
+	model_cfg = _load_yaml_config(args.model_config)
+
+	if args.use_gradient_checkpointing is None:
+		args.use_gradient_checkpointing = bool(_cfg_get(model_cfg, ("model", "use_gradient_checkpointing"), False))
+
+	if args.checkpoint_decoder_layers is None:
+		train_v = _cfg_get(train_cfg, ("model", "checkpoint_decoder_layers"), None)
+		model_v = _cfg_get(model_cfg, ("model", "checkpoint_decoder_layers"), False)
+		args.checkpoint_decoder_layers = bool(train_v) if train_v is not None else bool(model_v)
 
 
 def levenshtein_distance(s1: str, s2: str) -> int:
@@ -476,12 +722,13 @@ def batched_infer_ar(
 	eos_id: int,
 	max_len: int,
 	amp_enabled: bool,
+	amp_dtype: torch.dtype,
 ) -> List[List[int]]:
 	"""批量版 AR 贪心解码。"""
 	batch_size = images.size(0)
 	device = images.device
 
-	with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled):
+	with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
 		memory, memory_padding_mask = model.encode(images)
 		decode_cache = model.init_decode_cache(memory)
 
@@ -490,7 +737,7 @@ def batched_infer_ar(
 	finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
 	# 循环从步数 1 开始，直到 max_len
 	for step in range(1, max_len):
-		with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled):
+		with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
 			current_token = generated[:, step - 1]
 			logits, decode_cache = model.decode_step_cached(
 				memory=memory,
@@ -518,13 +765,27 @@ def batched_infer_ar(
 	return output_batch
 
 
-def build_model(checkpoint_path: str, tokenizer: Tokenizer, d_model: int, device: torch.device) -> LatexOCRModel:
+def build_model(
+	checkpoint_path: str,
+	tokenizer: Tokenizer,
+	d_model: int,
+	device: torch.device,
+	use_gradient_checkpointing: bool,
+	checkpoint_decoder_layers: bool,
+	enable_compile: bool,
+) -> LatexOCRModel:
 	vocab_size = tokenizer.get_vocab_size()
 	pad_id = tokenizer.token_to_id("[PAD]")
 	if pad_id is None:
 		raise RuntimeError("Tokenizer 缺少 [PAD] token")
 
-	model = LatexOCRModel(vocab_size=vocab_size, d_model=d_model, pad_id=pad_id).to(device)
+	model = LatexOCRModel(
+		vocab_size=vocab_size,
+		d_model=d_model,
+		pad_id=pad_id,
+		use_gradient_checkpointing=use_gradient_checkpointing,
+		checkpoint_decoder_layers=checkpoint_decoder_layers,
+	).to(device)
 
 	if not os.path.exists(checkpoint_path):
 		raise FileNotFoundError(f"找不到 checkpoint: {checkpoint_path}")
@@ -541,12 +802,13 @@ def build_model(checkpoint_path: str, tokenizer: Tokenizer, d_model: int, device
 	state_dict = convert_legacy_attnres_state_dict(state_dict)
 	model.load_state_dict(state_dict, strict=True)
 	model.eval()
-	if hasattr(torch, "compile"):
+	if enable_compile and hasattr(torch, "compile"):
 		model = cast(LatexOCRModel, torch.compile(model))
 	return model
 
 
 def evaluate(args: argparse.Namespace) -> Tuple[float, float, int]:
+	resolve_eval_runtime_args(args)
 	device = torch.device(args.device)
 	tokenizer = Tokenizer.from_file(args.tokenizer)
 	svg_node_script = args.svg_node_script
@@ -583,9 +845,23 @@ def evaluate(args: argparse.Namespace) -> Tuple[float, float, int]:
 			pin_memory=(device.type == "cuda"),
 			persistent_workers=(args.num_workers > 0),
 		)
-		model = build_model(args.checkpoint, tokenizer, args.d_model, device)
+		model = build_model(
+			args.checkpoint,
+			tokenizer,
+			args.d_model,
+			device,
+			use_gradient_checkpointing=bool(args.use_gradient_checkpointing),
+			checkpoint_decoder_layers=bool(args.checkpoint_decoder_layers),
+			enable_compile=bool(args.enable_compile),
+		)
 		tf_model = cast(LatexOCRModel, getattr(model, "_orig_mod", model))
-		amp_enabled = device.type == "cuda"
+		amp_dtype_map = {
+			"fp16": torch.float16,
+			"bf16": torch.bfloat16,
+			"fp32": torch.float32,
+		}
+		eval_amp_dtype = amp_dtype_map[args.amp_dtype]
+		amp_enabled = device.type == "cuda" and args.amp_dtype != "fp32"
 
 		max_samples = len(dataset) if args.max_samples <= 0 else min(args.max_samples, len(dataset))
 		if max_samples <= 0:
@@ -614,7 +890,7 @@ def evaluate(args: argparse.Namespace) -> Tuple[float, float, int]:
 			# 训练口径 TokenAcc（Teacher-Forcing）：GT 前缀喂入，比较 next-token。
 			tf_inputs = target_ids[:, :-1].to(device)
 			tf_targets = target_ids[:, 1:].to(device)
-			with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp_enabled):
+			with torch.autocast(device_type=device.type, dtype=eval_amp_dtype, enabled=amp_enabled):
 				tf_logits = tf_model(images=images, tgt_seq=tf_inputs, is_causal=True)
 			tf_preds = tf_logits.argmax(dim=-1)
 			tf_valid_mask = tf_targets != pad_id
@@ -630,6 +906,7 @@ def evaluate(args: argparse.Namespace) -> Tuple[float, float, int]:
 				eos_id=eos_id,
 				max_len=args.max_len,
 				amp_enabled=amp_enabled,
+				amp_dtype=eval_amp_dtype,
 			)
 
 			for i in range(len(pred_batch)):
@@ -704,7 +981,7 @@ def evaluate(args: argparse.Namespace) -> Tuple[float, float, int]:
 			f.write("=== AR Eval Report (Visual Equivalence) ===\n")
 			f.write(f"checkpoint: {args.checkpoint}\n")
 			f.write(f"eval_h5: {args.eval_h5}\n")
-			f.write("visual_rule: normalize -> svg_dom -> path_signature\n")
+			f.write("visual_rule: normalize -> svg_dom(strict)\n")
 			f.write(f"svg_node_script: {svg_node_script}\n")
 			f.write(f"EvalProcessed: {processed}\n")
 			f.write(f"EvalRenderExact: {exact_match}\n")
@@ -737,7 +1014,7 @@ def evaluate(args: argparse.Namespace) -> Tuple[float, float, int]:
 		print(f"EvalTextEM(%)   : {text_em_rate * 100:.4f}")
 		print(f"EvalTokenAcc(%) : {token_acc_rate * 100:.4f}")
 		print(f"EvalTFTokenAcc(%): {tf_token_acc_rate * 100:.4f}")
-		print("VisualRule      : normalize -> svg_dom -> path_signature")
+		print("VisualRule      : normalize -> svg_dom(strict)")
 		print(f"SVGNodeScript   : {svg_node_script}")
 		print(f"EvalNED       : {avg_ned:.6f}") 
 		print(f"AvgED         : {avg_ed:.4f}")

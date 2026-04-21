@@ -1,25 +1,25 @@
 data:
   train_h5:
-    - C:/Projects/LatexProject/ConvResFormula/datasets/train96.h5 # 手写训练集
-    - C:/Projects/LatexProject/ConvResFormula/datasets/synthetic96.h5 # 合成训练集
+    - C:/Projects/LatexProject/ConvResFormula/datasets/train.h5 # 手写训练集
+    - C:/Projects/LatexProject/ConvResFormula/datasets/synthetic.h5 # 合成训练集
     - C:/Projects/LatexProject/ConvResFormula/datasets/symbols96.h5 # 单字符训练集
     - C:/Projects/LatexProject/ConvResFormula/datasets/wiki_train_314k.h5 # wiki训练集
-  eval_h5: C:/Projects/LatexProject/ConvResFormula/datasets/val96.h5 # 验证/评估集
+  eval_h5: C:/Projects/LatexProject/ConvResFormula/datasets/val.h5 # 验证/评估集
   tokenizer: C:/Projects/LatexProject/ConvResFormula/tokenizer_bpe.json # BPE 分词器
   max_area: 98304 # 图像动态缩放的面积上限
 
 training:
-  batch_size: 24 # 训练 batch 大小
+  batch_size: 32 # 训练 batch 大小
   num_workers: 4 # 训练 DataLoader 线程数
-  epochs: 40 # 总训练轮数
+  epochs: 20 # 总训练轮数
   seed: 42 # 随机种子
-  mix_ratio: [0, 0, 0, 1] # 多数据源采样比例，手写:合成:单字符:wiki
-  epoch_samples: 318984 # 每个 epoch 的采样总数，<=0 表示全量
+  mix_ratio: [4, 3, 1, 2] # 多数据源采样比例，真实手写:合成手写:单字符手写:wiki
+  epoch_samples: 524288 # 每个 epoch 的采样总数，<=0 表示全量
   bucket_mega_factor: 64 # 分桶 mega-batch 系数
 
 optimization:
-  encoder_lr: 7.0e-5 # 编码器学习率
-  decoder_lr: 1.0e-4 # 解码器学习率
+  encoder_lr: 2.0e-5 # 编码器学习率
+  decoder_lr: 1.0e-5 # 解码器学习率
   weight_decay: 1.0e-2 # AdamW 权重衰减
   label_smoothing: 0.1 # 交叉熵标签平滑，提升泛化能力
 
@@ -37,18 +37,19 @@ eval:
   num_workers: 2 # 评估 DataLoader 线程数
   samples: 1024 # 每轮评估抽样数量，<=0 表示全量
   max_len: 160 # 评估解码最大长度
-  skip_eval: True # 是否跳过训练期评估
+  amp_dtype: bf16 # 评估精度类型(fp16/bf16/fp32)
+  use_gradient_checkpointing: True # 评估阶段默认启用视觉梯度检查点
+  skip_eval: False # 是否跳过训练期评估
 
 runtime:
   ckpt_dir: checkpoints/ar # checkpoint 输出目录
   log_dir: logs/ar_logs # 日志输出目录
-  resume_ckpt: checkpoints\ar\epoch_1.pth # 恢复训练使用的 checkpoint
+  resume_ckpt: checkpoints\ar\epoch_5.pth # 恢复训练使用的 checkpoint
   resume: True # 是否默认启用断点恢复
   amp_dtype: fp16 # 训练精度类型(fp16/bf16/fp32)
-  cudnn_benchmark: False # 必须禁用
+  cudnn_benchmark: True # 启用 cudnn benchmark 模式以优化卷积性能
   channels_last: False # 启用 channels_last 内存格式
-  use_gradient_checkpointing: true # 启用梯度检查点以降低显存占用（会增加计算时间）
-  kernel_warmup_batches: 2 # 训练前预热批次数，过大可能显著拉长首轮启动
+  kernel_warmup_batches: 0 # 训练前预热批次数，过大可能显著拉长首轮启动
 
 cli_help:
   description: ConvNeXt-V2 + AttnRes 的 AR 训练脚本

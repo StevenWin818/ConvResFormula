@@ -3,6 +3,8 @@
 import argparse
 import os
 import random
+import shutil
+import subprocess
 import sys
 from collections import Counter
 from datetime import datetime
@@ -18,6 +20,13 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import ConcatDataset, DataLoader, Sampler
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 from tqdm import tqdm
+import logging
+import torch._inductor.config
+
+
+# 强制开启硬件级 TF32 核心计算
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cuda.matmul.allow_tf32 = True
 
 try:
 	import yaml
@@ -34,6 +43,9 @@ from src.engine.lr_schedulers import build_linear_warmup_cosine_scheduler, infer
 from src.engine.trainer import ARTrainer
 from src.models.latex_ocr_model import LatexOCRModel
 from src.models.text_decoder import convert_legacy_attnres_state_dict
+
+torch._inductor.config.fallback_random = True
+logging.getLogger("torch._inductor").setLevel(logging.ERROR)
 
 
 def parse_args() -> argparse.Namespace:
@@ -84,6 +96,10 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--eval_num_workers", type=int, default=None, help=h("eval_num_workers", "评估 DataLoader 线程数"))
 	parser.add_argument("--eval_samples", type=int, default=None, help=h("eval_samples", "每轮评估抽样数量，<=0 表示全量"))
 	parser.add_argument("--eval_max_len", type=int, default=None, help=h("eval_max_len", "评估解码最大长度"))
+	parser.add_argument("--eval_amp_dtype", type=str, choices=["fp16", "bf16", "fp32"], default=None, help="评估精度类型: fp16 / bf16 / fp32")
+	parser.add_argument("--eval_use_gradient_checkpointing", dest="eval_use_gradient_checkpointing", action="store_true", help="评估阶段启用视觉梯度检查点")
+	parser.add_argument("--eval_no_gradient_checkpointing", dest="eval_use_gradient_checkpointing", action="store_false", help="评估阶段禁用视觉梯度检查点")
+	parser.set_defaults(eval_use_gradient_checkpointing=None)
 	parser.add_argument("--amp_dtype", type=str, choices=["fp16", "bf16", "fp32"], default=None, help=h("amp_dtype", "训练精度类型: fp16 / bf16 / fp32"))
 
 	parser.add_argument("--use_gradient_checkpointing", dest="use_gradient_checkpointing", action="store_true", 
@@ -206,6 +222,11 @@ def apply_config_defaults(args: argparse.Namespace, train_cfg: Dict[str, Any], m
 	args.eval_num_workers = args.eval_num_workers if args.eval_num_workers is not None else int(_cfg_get(train_cfg, ("eval", "num_workers"), 2))
 	args.eval_samples = args.eval_samples if args.eval_samples is not None else int(_cfg_get(train_cfg, ("eval", "samples"), 1500))
 	args.eval_max_len = args.eval_max_len if args.eval_max_len is not None else int(_cfg_get(train_cfg, ("eval", "max_len"), 160))
+	args.eval_amp_dtype = str(args.eval_amp_dtype or _cfg_get(train_cfg, ("eval", "amp_dtype"), "bf16")).lower()
+	if args.eval_amp_dtype not in {"fp16", "bf16", "fp32"}:
+		raise ValueError(f"eval.amp_dtype 必须是 fp16/bf16/fp32，当前为: {args.eval_amp_dtype}")
+	if args.eval_use_gradient_checkpointing is None:
+		args.eval_use_gradient_checkpointing = bool(_cfg_get(train_cfg, ("eval", "use_gradient_checkpointing"), True))
 	if args.skip_eval is None:
 		args.skip_eval = bool(_cfg_get(train_cfg, ("eval", "skip_eval"), False))
 
@@ -220,7 +241,7 @@ def apply_config_defaults(args: argparse.Namespace, train_cfg: Dict[str, Any], m
 	if args.channels_last is None:
 		args.channels_last = bool(_cfg_get(train_cfg, ("runtime", "channels_last"), False))
 	if args.use_gradient_checkpointing is None:
-		args.use_gradient_checkpointing = bool(_cfg_get(train_cfg, ("runtime", "use_gradient_checkpointing"), False))
+		args.use_gradient_checkpointing = bool(_cfg_get(model_cfg, ("model", "use_gradient_checkpointing"), False))
 	args.checkpoint_segments = args.checkpoint_segments if args.checkpoint_segments is not None else int(_cfg_get(train_cfg, ("model", "checkpoint_segments"), 1))
 	if args.checkpoint_decoder_layers is None:
 		args.checkpoint_decoder_layers = bool(_cfg_get(train_cfg, ("model", "checkpoint_decoder_layers"), False))
@@ -248,6 +269,142 @@ def set_seed(seed: int) -> None:
 		torch.cuda.manual_seed_all(seed)
 
 
+def ensure_msvc_cl_on_path() -> str:
+	"""在 Windows 下自动发现 cl.exe 并注入 PATH，返回 cl 路径；失败时返回空串。"""
+	if os.name != "nt":
+		return ""
+
+	cl_path = shutil.which("cl")
+	if cl_path:
+		return cl_path
+
+	roots = [os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles")]
+	editions = ("BuildTools", "Community", "Professional", "Enterprise", "Preview")
+	candidates: List[Path] = []
+
+	for root in roots:
+		if not root:
+			continue
+		vs_root = Path(root) / "Microsoft Visual Studio"
+		if not vs_root.exists():
+			continue
+		for edition in editions:
+			pattern = f"*/{edition}/VC/Tools/MSVC/*/bin/Hostx64/x64/cl.exe"
+			candidates.extend(vs_root.glob(pattern))
+
+	if not candidates:
+		return ""
+
+	def _ver_key(p: Path) -> Tuple[int, ...]:
+		version_str = p.parents[3].name
+		parts = []
+		for token in version_str.split("."):
+			try:
+				parts.append(int(token))
+			except ValueError:
+				parts.append(0)
+		return tuple(parts)
+
+	best = max(candidates, key=_ver_key)
+	bin_dir = str(best.parent)
+	os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
+	return shutil.which("cl") or str(best)
+
+
+def bootstrap_vs_build_env() -> bool:
+	"""通过 LaunchDevCmd 导入 VS 编译环境变量，补全 INCLUDE/LIB/LIBPATH。"""
+	if os.name != "nt":
+		return True
+
+	# 若关键变量已存在，则不重复导入。
+	if os.environ.get("INCLUDE") and os.environ.get("LIB"):
+		return True
+
+	vs_devcmd = Path(r"C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\Common7\Tools\LaunchDevCmd.bat")
+	if not vs_devcmd.exists():
+		return False
+
+	cmd = f'"{vs_devcmd}" -arch=x64 -host_arch=x64 >nul && set'
+	proc = subprocess.run(
+		["cmd", "/d", "/s", "/c", cmd],
+		capture_output=True,
+		text=True,
+		encoding="utf-8",
+		errors="ignore",
+	)
+	if proc.returncode != 0:
+		proc = None
+
+	updated = 0
+	if proc is not None:
+		for line in proc.stdout.splitlines():
+			if "=" not in line:
+				continue
+			key, value = line.split("=", 1)
+			if key in {"PATH", "INCLUDE", "LIB", "LIBPATH", "UCRTVersion", "WindowsSdkDir", "WindowsSdkVerBinPath"}:
+				os.environ[key] = value
+				updated += 1
+
+	if updated > 0 and os.environ.get("INCLUDE") and os.environ.get("LIB"):
+		return True
+
+	# 兜底路径：手动拼接 MSVC + Windows SDK 的头文件与库目录。
+	cl_path = ensure_msvc_cl_on_path()
+	if not cl_path:
+		return False
+
+	cl_file = Path(cl_path)
+	msvc_root = cl_file.parents[3]  # .../VC/Tools/MSVC/<version>
+	msvc_include = msvc_root / "include"
+	msvc_lib = msvc_root / "lib" / "x64"
+
+	kit_root = Path(r"C:\Program Files (x86)\Windows Kits\10")
+	include_root = kit_root / "Include"
+	lib_root = kit_root / "Lib"
+
+	def _pick_latest(base: Path) -> Path | None:
+		if not base.exists():
+			return None
+		versions = [p for p in base.iterdir() if p.is_dir()]
+		if not versions:
+			return None
+		return sorted(versions, key=lambda p: p.name)[-1]
+
+	kit_inc_ver = _pick_latest(include_root)
+	kit_lib_ver = _pick_latest(lib_root)
+	if kit_inc_ver is None or kit_lib_ver is None:
+		return False
+
+	include_parts = [
+		str(msvc_include),
+		str(kit_inc_ver / "ucrt"),
+		str(kit_inc_ver / "shared"),
+		str(kit_inc_ver / "um"),
+		str(kit_inc_ver / "winrt"),
+		str(kit_inc_ver / "cppwinrt"),
+	]
+	lib_parts = [
+		str(msvc_lib),
+		str(kit_lib_ver / "ucrt" / "x64"),
+		str(kit_lib_ver / "um" / "x64"),
+	]
+
+	def _merge_env(name: str, new_parts: List[str]) -> None:
+		existing = os.environ.get(name, "")
+		existing_parts = [p for p in existing.split(os.pathsep) if p]
+		merged: List[str] = []
+		for p in new_parts + existing_parts:
+			if p and p not in merged:
+				merged.append(p)
+		os.environ[name] = os.pathsep.join(merged)
+
+	_merge_env("INCLUDE", include_parts)
+	_merge_env("LIB", lib_parts)
+	_merge_env("LIBPATH", [str(msvc_lib)])
+
+	return bool(os.environ.get("INCLUDE") and os.environ.get("LIB"))
+
+
 def build_optimizer(model: LatexOCRModel, encoder_lr: float, decoder_lr: float, weight_decay: float) -> optim.AdamW:
 	encoder_params: List[torch.nn.Parameter] = []
 	other_params: List[torch.nn.Parameter] = []
@@ -255,7 +412,8 @@ def build_optimizer(model: LatexOCRModel, encoder_lr: float, decoder_lr: float, 
 	for name, param in model.named_parameters():
 		if not param.requires_grad:
 			continue
-		if name.startswith("encoder."):
+		# 兼容 torch.compile 后的参数名前缀（如 _orig_mod.encoder.xxx）
+		if name.startswith("encoder.") or ".encoder." in name:
 			encoder_params.append(param)
 		else:
 			other_params.append(param)
@@ -658,6 +816,16 @@ def evaluate_epoch(
 	return em_rate, error_counter, stats
 
 
+def set_backbone_grad_checkpointing(model: LatexOCRModel, enabled: bool) -> None:
+	"""在运行期切换视觉骨干的 timm 梯度检查点开关。"""
+	raw_model = cast(LatexOCRModel, getattr(model, "_orig_mod", model))
+	encoder = getattr(raw_model, "encoder", None)
+	backbone = getattr(encoder, "backbone", None)
+	setter = getattr(backbone, "set_grad_checkpointing", None)
+	if callable(setter):
+		setter(bool(enabled))
+
+
 def warmup_kernel_cache(
 	model: LatexOCRModel,
 	train_loader: DataLoader,
@@ -726,10 +894,16 @@ def main() -> None:
 	}
 	amp_dtype = amp_dtype_map[args.amp_dtype]
 	amp_enabled = (device.type == "cuda") and (args.amp_dtype != "fp32")
+	eval_amp_dtype = amp_dtype_map[args.eval_amp_dtype]
+	eval_amp_enabled = (device.type == "cuda") and (args.eval_amp_dtype != "fp32")
 	if device.type != "cuda" and args.amp_dtype != "fp32":
 		print("警告: 当前为 CPU 设备，已自动降级为 fp32 训练。")
 		amp_dtype = torch.float32
 		amp_enabled = False
+	if device.type != "cuda" and args.eval_amp_dtype != "fp32":
+		print("警告: 当前为 CPU 设备，评估精度已自动降级为 fp32。")
+		eval_amp_dtype = torch.float32
+		eval_amp_enabled = False
 
 	tokenizer = Tokenizer.from_file(args.tokenizer)
 	vocab_size = tokenizer.get_vocab_size()
@@ -843,6 +1017,35 @@ def main() -> None:
 	).to(device)
 	if args.channels_last:
 		model = model.to(memory_format=torch.channels_last) # type: ignore
+	if os.name == "nt":
+		if bootstrap_vs_build_env():
+			print("✅ 已导入 VS Build Tools 编译环境(INCLUDE/LIB/LIBPATH)。")
+		else:
+			print("⚠️ 未能导入 VS Build Tools 编译环境，torch.compile 可能回退。")
+	compile_fn = getattr(torch, "compile", None)
+	cl_path = ensure_msvc_cl_on_path() if os.name == "nt" else ""
+	can_compile = (compile_fn is not None) and (os.name != "nt" or bool(cl_path))
+	if compile_fn is not None and os.name == "nt" and not cl_path:
+		print("⚠️ 检测到未安装 MSVC cl.exe，已禁用 torch.compile 以避免 Inductor 运行时崩溃。")
+	if compile_fn is not None and os.name == "nt" and cl_path:
+		print(f"✅ 已检测到 MSVC 编译器: {cl_path}")
+	if can_compile:
+		if compile_fn is None:
+			raise RuntimeError("内部错误: can_compile=True 但 torch.compile 不可用")
+		print("⚡ 开启 torch.compile(dynamic=True) 进行底层算子融合...")
+		# 允许 Dynamo 在后续动态 shape 重编译失败时自动回退 eager，避免中途训练中断。
+		torch._dynamo.config.suppress_errors = True
+		compiled_model = cast(LatexOCRModel, compile_fn(model, dynamic=True))
+		try:
+			with torch.no_grad():
+				probe_images = torch.zeros((1, 1, 64, 64), dtype=torch.float32, device=device)
+				probe_tgt = torch.full((1, 2), pad_id, dtype=torch.long, device=device)
+				_ = compiled_model(images=probe_images, tgt_seq=probe_tgt, is_causal=True)
+			model = compiled_model
+		except Exception as exc:
+			print(f"⚠️ torch.compile 预热探测失败，已回退 eager 模式: {type(exc).__name__}: {exc}")
+			if device.type == "cuda":
+				torch.cuda.empty_cache()
 	optimizer = build_optimizer(
 		model=model,
 		encoder_lr=args.encoder_lr,
@@ -936,8 +1139,6 @@ def main() -> None:
 
 	eval_model_for_ckpt = cast(LatexOCRModel, ema_model.module if ema_model is not None else model)
 	eval_model = eval_model_for_ckpt
-	if hasattr(torch, "compile"):
-		eval_model = cast(LatexOCRModel, torch.compile(eval_model))
 
 	trainer = ARTrainer(
 		model=model,
@@ -961,6 +1162,10 @@ def main() -> None:
 	print(
 		f"AR 训练启动 | Device={device} | AMP={amp_enabled} | AMP_DTYPE={args.amp_dtype} | "
 		f"LabelSmoothing={args.label_smoothing}"
+	)
+	print(
+		f"Eval 默认策略 | EvalAMP={eval_amp_enabled} | EvalAMP_DTYPE={args.eval_amp_dtype} | "
+		f"EvalGradCheckpoint={bool(args.eval_use_gradient_checkpointing)}"
 	)
 	print(f"TrainConfig={args.train_config}")
 	print(f"ModelConfig={args.model_config}")
@@ -1001,20 +1206,24 @@ def main() -> None:
 		error_counter: Counter[str] = Counter()
 
 		if (not args.skip_eval) and eval_loader is not None and (epoch % max(1, args.eval_interval) == 0):
-			eval_em, error_counter, eval_stats = evaluate_epoch(
-				model=eval_model,
-				eval_loader=eval_loader,
-				tokenizer=tokenizer,
-				device=device,
-				amp_enabled=amp_enabled,
-				amp_dtype=amp_dtype,
-				channels_last=bool(args.channels_last),
-				pad_id=pad_id,
-				bos_id=bos_id,
-				eos_id=eos_id,
-				num_samples=args.eval_samples,
-				max_len=args.eval_max_len,
-			)
+			set_backbone_grad_checkpointing(eval_model, bool(args.eval_use_gradient_checkpointing))
+			try:
+				eval_em, error_counter, eval_stats = evaluate_epoch(
+					model=eval_model,
+					eval_loader=eval_loader,
+					tokenizer=tokenizer,
+					device=device,
+					amp_enabled=eval_amp_enabled,
+					amp_dtype=eval_amp_dtype,
+					channels_last=bool(args.channels_last),
+					pad_id=pad_id,
+					bos_id=bos_id,
+					eos_id=eos_id,
+					num_samples=args.eval_samples,
+					max_len=args.eval_max_len,
+				)
+			finally:
+				set_backbone_grad_checkpointing(eval_model, bool(args.use_gradient_checkpointing))
 			eval_processed = eval_stats["processed"]
 			eval_exact = eval_stats["exact"]
 			eval_ned = eval_stats["avg_ned"]

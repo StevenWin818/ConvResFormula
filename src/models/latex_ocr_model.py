@@ -44,7 +44,8 @@ class LatexOCRModel(nn.Module):
             pretrained=vision_pretrained,
             d_model=d_model, 
             in_chans=vision_in_chans,
-            drop_path_rate=vision_drop_path_rate
+            drop_path_rate=vision_drop_path_rate,
+            use_gradient_checkpointing=self.use_gradient_checkpointing,
         )
         
         # 2. 文本词表 Embedding 与位置编码
