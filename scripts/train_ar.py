@@ -85,6 +85,8 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--encoder_lr", type=float, default=None, help=h("encoder_lr", "视觉编码器学习率"))
 	parser.add_argument("--decoder_lr", type=float, default=None, help=h("decoder_lr", "解码器学习率"))
 	parser.add_argument("--weight_decay", type=float, default=None, help=h("weight_decay", "权重衰减系数"))
+	parser.add_argument("--ctc_weight", type=float, default=None, help="CTC 辅助损失权重")
+	parser.add_argument("--ohem_ratio", type=float, default=None, help="OHEM 困难样本保留比例")
 
 	parser.add_argument("--warmup_epochs", type=float, default=None, help=h("warmup_epochs", "学习率 warmup 轮数"))
 	parser.add_argument("--warmup_start_lr", type=float, default=None, help=h("warmup_start_lr", "warmup 起始学习率"))
@@ -209,12 +211,20 @@ def apply_config_defaults(args: argparse.Namespace, train_cfg: Dict[str, Any], m
 	args.encoder_lr = args.encoder_lr if args.encoder_lr is not None else float(_cfg_get(train_cfg, ("optimization", "encoder_lr"), 5e-5))
 	args.decoder_lr = args.decoder_lr if args.decoder_lr is not None else float(_cfg_get(train_cfg, ("optimization", "decoder_lr"), 1e-4))
 	args.weight_decay = args.weight_decay if args.weight_decay is not None else float(_cfg_get(train_cfg, ("optimization", "weight_decay"), 1e-2))
+	args.ctc_weight = args.ctc_weight if args.ctc_weight is not None else float(_cfg_get(train_cfg, ("optimization", "ctc_weight"), 0.5))
+	args.ohem_ratio = args.ohem_ratio if args.ohem_ratio is not None else float(_cfg_get(train_cfg, ("optimization", "ohem_ratio"), 0.5))
 
 	args.warmup_epochs = args.warmup_epochs if args.warmup_epochs is not None else float(_cfg_get(train_cfg, ("scheduler", "warmup_epochs"), 1.0))
 	args.warmup_start_lr = args.warmup_start_lr if args.warmup_start_lr is not None else float(_cfg_get(train_cfg, ("scheduler", "warmup_start_lr"), 1e-7))
 	args.eta_min = args.eta_min if args.eta_min is not None else float(_cfg_get(train_cfg, ("scheduler", "eta_min"), 1e-6))
 
 	args.label_smoothing = float(_cfg_get(train_cfg, ("optimization", "label_smoothing"), 0.1))
+
+	augment_cfg = _cfg_get(train_cfg, ("augmentation",), {})
+	if not isinstance(augment_cfg, dict):
+		augment_cfg = {}
+	args.enable_augment = bool(augment_cfg.get("enable", True))
+	args.augmentation_cfg = augment_cfg
 
 	args.log_interval = args.log_interval if args.log_interval is not None else int(_cfg_get(train_cfg, ("logging", "log_interval"), 20))
 	args.eval_interval = args.eval_interval if args.eval_interval is not None else int(_cfg_get(train_cfg, ("eval", "eval_interval"), 1))
@@ -922,7 +932,13 @@ def main() -> None:
 		raise FileNotFoundError(f"训练集不存在，请检查路径: {args.train_h5}")
 
 	datasets = [
-		FormulaDataset(h5_path=path, tokenizer_path=args.tokenizer, max_area=args.max_area, enable_augment=True)
+		FormulaDataset(
+			h5_path=path,
+			tokenizer_path=args.tokenizer,
+			max_area=args.max_area,
+			enable_augment=args.enable_augment,
+			augment_config=args.augmentation_cfg,
+		)
 		for path in dataset_paths
 	]
 
@@ -1011,6 +1027,7 @@ def main() -> None:
 		vocab_size=vocab_size, 
 		d_model=args.d_model, 
 		pad_id=pad_id,
+		eos_id=eos_id,
 		use_gradient_checkpointing=args.use_gradient_checkpointing,
 		checkpoint_segments=args.checkpoint_segments if args.checkpoint_segments is not None else 1,
 		checkpoint_decoder_layers=args.checkpoint_decoder_layers if args.checkpoint_decoder_layers is not None else False,
@@ -1083,7 +1100,11 @@ def main() -> None:
 		# 使用 .get() 安全获取模型，兼容纯权重字典
 		state_dict = checkpoint.get("model_raw", checkpoint.get("model", checkpoint))
 		model_state_dict = convert_legacy_attnres_state_dict(state_dict)
-		model.load_state_dict(model_state_dict, strict=False)
+		incompatible = model.load_state_dict(model_state_dict, strict=False)
+		if incompatible.missing_keys:
+			print(f"警告: checkpoint 缺少 {len(incompatible.missing_keys)} 个参数（含新增 CTC 头时属正常）。")
+		if incompatible.unexpected_keys:
+			print(f"警告: checkpoint 存在 {len(incompatible.unexpected_keys)} 个未使用参数。")
 
 		ema_model = AveragedModel(model, multi_avg_fn=ema_avg_fn)
 		ema_state_dict = checkpoint.get("ema_model")
@@ -1151,6 +1172,8 @@ def main() -> None:
 		channels_last=bool(args.channels_last),
 		label_smoothing=args.label_smoothing,
 		target_ignore_index=-100,
+		ctc_weight=args.ctc_weight,
+		ohem_ratio=args.ohem_ratio,
 		ema_model=ema_model,
 	)
 

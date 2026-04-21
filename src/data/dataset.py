@@ -10,6 +10,11 @@ from torch.utils.data import Dataset
 from tokenizers import Tokenizer
 from typing import Tuple, Dict, Any, Optional
 
+try:
+    import albumentations as A
+except ImportError:
+    A = None
+
 def calculate_dynamic_dims(h_orig: int, w_orig: int, max_area: int = 98304, min_size: int = 32, stride: int = 32) -> Tuple[int, int]:
     """
     计算基于面积约束且符合 ConvNeXt-V2 步长要求的动态分辨率。
@@ -29,7 +34,14 @@ def calculate_dynamic_dims(h_orig: int, w_orig: int, max_area: int = 98304, min_
     return aligned_h, aligned_w
 
 class FormulaDataset(Dataset):
-    def __init__(self, h5_path: str, tokenizer_path: str, max_area: int = 98304, enable_augment: bool = False):
+    def __init__(
+        self,
+        h5_path: str,
+        tokenizer_path: str,
+        max_area: int = 98304,
+        enable_augment: bool = False,
+        augment_config: Optional[Dict[str, Any]] = None,
+    ):
         """
         Args:
             h5_path: HDF5 数据集路径
@@ -40,6 +52,7 @@ class FormulaDataset(Dataset):
         self.h5_path = h5_path
         self.max_area = max_area
         self.enable_augment = bool(enable_augment)
+        self.augment_config = augment_config if isinstance(augment_config, dict) else {}
         
         # 加载 BPE 分词器
         self.tokenizer = Tokenizer.from_file(tokenizer_path)
@@ -76,6 +89,7 @@ class FormulaDataset(Dataset):
         self.images_ds: Optional[Any] = None
         self.labels_ds: Optional[Any] = None
         self.raw_labels_ds: Optional[Any] = None
+        self.albu_transform = self._build_albu_transform()
 
     def __len__(self) -> int:
         return self.length
@@ -87,6 +101,46 @@ class FormulaDataset(Dataset):
         if isinstance(raw, np.bytes_):
             return bytes(raw).decode('utf-8')
         return str(raw)
+
+    def _build_albu_transform(self):
+        if (not self.enable_augment) or A is None:
+            return None
+
+        grid_cfg = self.augment_config.get("grid_distortion", {})
+        elastic_cfg = self.augment_config.get("elastic_transform", {})
+
+        transforms = [
+            A.GridDistortion(
+                num_steps=int(grid_cfg.get("num_steps", 5)),
+                distort_limit=float(grid_cfg.get("distort_limit", 0.3)),
+                p=float(grid_cfg.get("prob", 0.5)),
+            ),
+            A.ElasticTransform(
+                alpha=float(elastic_cfg.get("alpha", 1.0)),
+                sigma=float(elastic_cfg.get("sigma", 50.0)),
+                alpha_affine=float(elastic_cfg.get("alpha_affine", 50.0)),
+                p=float(elastic_cfg.get("prob", 0.5)),
+            ),
+        ]
+        return A.Compose(transforms)
+
+    def _apply_morphology(self, img: np.ndarray) -> np.ndarray:
+        morph_cfg = self.augment_config.get("morphology", {})
+        prob = float(morph_cfg.get("prob", 0.4))
+        if np.random.rand() >= prob:
+            return img
+
+        kernel_size = max(1, int(morph_cfg.get("kernel_size", 3)))
+        iterations = max(1, int(morph_cfg.get("iterations", 1)))
+        ops = morph_cfg.get("ops", ["erode", "dilate"])
+        if not isinstance(ops, list) or len(ops) == 0:
+            ops = ["erode", "dilate"]
+
+        op = str(np.random.choice(ops)).lower()
+        kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+        if op == "erode":
+            return cv2.erode(img, kernel, iterations=iterations)
+        return cv2.dilate(img, kernel, iterations=iterations)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         # 懒加载：在每个 worker 首次访问时打开文件
@@ -135,15 +189,34 @@ class FormulaDataset(Dataset):
         if self.enable_augment:
             img_float = img.astype(np.float32)
 
-            if np.random.rand() < 0.2:
-                noise = np.random.randn(*img_float.shape) * np.random.uniform(2.0, 8.0)
+            noise_cfg = self.augment_config.get("gaussian_noise", {})
+            noise_prob = float(noise_cfg.get("prob", 0.2))
+            sigma_min = float(noise_cfg.get("sigma_min", 2.0))
+            sigma_max = float(noise_cfg.get("sigma_max", 8.0))
+            if sigma_max < sigma_min:
+                sigma_min, sigma_max = sigma_max, sigma_min
+
+            if np.random.rand() < noise_prob:
+                noise = np.random.randn(*img_float.shape) * np.random.uniform(sigma_min, sigma_max)
                 img_float = img_float + noise
 
-            if np.random.rand() < 0.3:
-                alpha = np.random.uniform(0.7, 1.2)
+            contrast_cfg = self.augment_config.get("contrast", {})
+            contrast_prob = float(contrast_cfg.get("prob", 0.3))
+            alpha_min = float(contrast_cfg.get("alpha_min", 0.7))
+            alpha_max = float(contrast_cfg.get("alpha_max", 1.2))
+            if alpha_max < alpha_min:
+                alpha_min, alpha_max = alpha_max, alpha_min
+
+            if np.random.rand() < contrast_prob:
+                alpha = np.random.uniform(alpha_min, alpha_max)
                 img_float = img_float * alpha
 
             img = np.clip(img_float, 0.0, 255.0).astype(np.uint8)
+
+            if self.albu_transform is not None:
+                img = self.albu_transform(image=img)["image"]
+
+            img = self._apply_morphology(img)
             
         # 转换为 Tensor，归一化到 [0, 1] 并增加通道维度 [1, H, W]
         img_tensor = torch.from_numpy(img).float().unsqueeze(0) / 255.0

@@ -4,7 +4,7 @@ LaTeX OCR 主模型组装与 MLM 前向接口。
 import math
 import torch
 import torch.nn as nn
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 from .vision_encoder import ConvNeXtV2Encoder
 from .text_decoder import AttnResDecodeCache, AttnResTextDecoder
@@ -15,6 +15,7 @@ class LatexOCRModel(nn.Module):
         vocab_size: int,
         d_model: int = 256,
         pad_id: int = 0,
+        eos_id: Optional[int] = None,
         vision_model_name: str = "convnextv2_nano",
         vision_pretrained: bool = True,
         vision_in_chans: int = 1,
@@ -31,7 +32,10 @@ class LatexOCRModel(nn.Module):
     ):
         super().__init__()
         self.d_model = d_model
+        self.vocab_size = int(vocab_size)
         self.pad_id = pad_id
+        self.eos_id = eos_id
+        self.ctc_blank_id = int(vocab_size)
         self.use_learned_position_embeddings = use_learned_position_embeddings
         self.max_position_embeddings = max_position_embeddings
         self.use_gradient_checkpointing = bool(use_gradient_checkpointing)
@@ -43,6 +47,7 @@ class LatexOCRModel(nn.Module):
             model_name=vision_model_name,
             pretrained=vision_pretrained,
             d_model=d_model, 
+            ctc_vocab_size=int(vocab_size) + 1,
             in_chans=vision_in_chans,
             drop_path_rate=vision_drop_path_rate,
             use_gradient_checkpointing=self.use_gradient_checkpointing,
@@ -86,9 +91,16 @@ class LatexOCRModel(nn.Module):
         mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
         return mask
 
-    def encode(self, images: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def encode(
+        self,
+        images: torch.Tensor,
+        return_aux: bool = False,
+    ) -> Union[
+        Tuple[torch.Tensor, torch.Tensor],
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ]:
         """返回特征序列和 Padding 掩码"""
-        return self.encoder(images)
+        return self.encoder(images, return_aux=return_aux)
 
     def precompute_cross_kv(self, memory: torch.Tensor):
         """预计算解码器交叉注意力 K/V，用于自回归推理。"""
@@ -188,10 +200,20 @@ class LatexOCRModel(nn.Module):
         logits = self.head(decoder_out.squeeze(1))
         return logits, new_cache
 
-    def forward(self, images: torch.Tensor, tgt_seq: torch.Tensor, is_causal: bool = True) -> torch.Tensor:
+    def forward(
+        self,
+        images: torch.Tensor,
+        tgt_seq: torch.Tensor,
+        is_causal: bool = True,
+        return_aux: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """恢复为最简单的调用，不要在这里做 checkpoint"""
-        # 1. 直接调用 encode，不要用 checkpoint wrapper
-        memory, memory_mask = self.encode(images)
+        # 1. 默认路径保持原接口，仅在 return_aux=True 时返回额外分支
+        ctc_logits: Optional[torch.Tensor] = None
+        if return_aux:
+            memory, memory_mask, ctc_logits = self.encode(images, return_aux=True)
+        else:
+            memory, memory_mask = self.encode(images, return_aux=False)
 
         # 解码步骤
         tgt_key_padding_mask = (tgt_seq == self.pad_id)
@@ -211,4 +233,6 @@ class LatexOCRModel(nn.Module):
         )
 
         logits = self.head(decoder_out)
+        if return_aux and ctc_logits is not None:
+            return logits, ctc_logits
         return logits

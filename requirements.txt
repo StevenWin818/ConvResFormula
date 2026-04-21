@@ -1,2 +1,3 @@
 # Python dependencies for ConvNeXt-V2 + AttnRes + MLM pipeline
 pyyaml
+albumentations>=1.3.0

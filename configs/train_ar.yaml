@@ -11,17 +11,44 @@ data:
 training:
   batch_size: 32 # 训练 batch 大小
   num_workers: 4 # 训练 DataLoader 线程数
-  epochs: 20 # 总训练轮数
+  epochs: 18 # 总训练轮数
   seed: 42 # 随机种子
   mix_ratio: [4, 3, 1, 2] # 多数据源采样比例，真实手写:合成手写:单字符手写:wiki
   epoch_samples: 524288 # 每个 epoch 的采样总数，<=0 表示全量
   bucket_mega_factor: 64 # 分桶 mega-batch 系数
 
 optimization:
-  encoder_lr: 2.0e-5 # 编码器学习率
-  decoder_lr: 1.0e-5 # 解码器学习率
+  encoder_lr: 5.0e-5 # 编码器学习率
+  decoder_lr: 2.0e-5 # 解码器学习率
   weight_decay: 1.0e-2 # AdamW 权重衰减
   label_smoothing: 0.1 # 交叉熵标签平滑，提升泛化能力
+  ctc_weight: 0.5 # CTC 辅助损失权重
+  ohem_ratio: 0.5 # OHEM 困难样本保留比例
+
+augmentation:
+  enable: true
+  gaussian_noise:
+    prob: 0.2
+    sigma_min: 2.0
+    sigma_max: 8.0
+  contrast:
+    prob: 0.3
+    alpha_min: 0.7
+    alpha_max: 1.2
+  grid_distortion:
+    prob: 0.5
+    num_steps: 5
+    distort_limit: 0.3
+  elastic_transform:
+    prob: 0.5
+    alpha: 1.0
+    sigma: 50.0
+    alpha_affine: 50.0
+  morphology:
+    prob: 0.4
+    kernel_size: 3
+    iterations: 1
+    ops: [erode, dilate]
 
 scheduler:
   warmup_epochs: 1.0 # 线性预热轮数
@@ -44,7 +71,7 @@ eval:
 runtime:
   ckpt_dir: checkpoints/ar # checkpoint 输出目录
   log_dir: logs/ar_logs # 日志输出目录
-  resume_ckpt: checkpoints\ar\epoch_5.pth # 恢复训练使用的 checkpoint
+  resume_ckpt: checkpoints\ar\epoch_15_stripped.pth # 恢复训练使用的 checkpoint
   resume: True # 是否默认启用断点恢复
   amp_dtype: fp16 # 训练精度类型(fp16/bf16/fp32)
   cudnn_benchmark: True # 启用 cudnn benchmark 模式以优化卷积性能

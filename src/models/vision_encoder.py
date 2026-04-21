@@ -4,7 +4,7 @@ ConvNeXt-V2 视觉编码器接口。
 """
 
 import math
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -63,6 +63,7 @@ class ConvNeXtV2Encoder(nn.Module):
         model_name: str = 'convnextv2_pico', 
         pretrained: bool = True, 
         d_model: int = 512, 
+        ctc_vocab_size: int = 4001,
         in_chans: int = 1,
         drop_path_rate: float = 0.0, # 接收参数，默认为0保持向后兼容
         use_gradient_checkpointing: bool = True,
@@ -102,7 +103,18 @@ class ConvNeXtV2Encoder(nn.Module):
         # 注意：这里的 max_h 和 max_w 是指“特征图”的最大尺寸。
         self.pos_encoder = PositionalEncoding2D(d_model=d_model, max_h=128, max_w=1024)
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        # 4. CTC 辅助头：将宽度序列映射到词表（含 blank）
+        self.ctc_head = nn.Linear(d_model, int(ctc_vocab_size))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        return_aux: bool = False,
+    ) -> Union[
+        Tuple[torch.Tensor, torch.Tensor],
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ]:
         """
         Args:
             x: [Batch, 1, H, W] 归一化后的图像张量
@@ -130,8 +142,18 @@ class ConvNeXtV2Encoder(nn.Module):
             downsampled_mask = F.max_pool2d(x, kernel_size=32, stride=32)
             memory_padding_mask = (downsampled_mask.view(b, -1) <= 1e-5)
 
+        ctc_logits = None
+        if return_aux:
+            # CTC 分支按高度池化成宽度序列: [B, C, H, W] -> [B, W, C]
+            ctc_memory = features.mean(dim=2).permute(0, 2, 1).contiguous()
+            # CTCLoss 使用 [T, B, C] 排布
+            ctc_logits = self.ctc_head(ctc_memory).permute(1, 0, 2).contiguous()
+
         # 5. 展平为 1D 序列 (从 2D 图变为文字序列一样的排布)
         # [Batch, d_model, H_feat, W_feat] -> [Batch, d_model, H_feat * W_feat] -> [Batch, Seq_Len, d_model]
         features = features.flatten(2).permute(0, 2, 1)
-        
+
+        if return_aux and ctc_logits is not None:
+            return features, memory_padding_mask, ctc_logits
+
         return features, memory_padding_mask
