@@ -11,7 +11,7 @@ from typing import Optional, Tuple, Dict, Union, Any
 class SIGRegLikeLoss(nn.Module):
     """
     SIGReg-like 正则化损失
-    
+        self._projection_matrix_cache: Optional[torch.Tensor] = None
     原理：
     1. 对输入 embedding 进行 M 次随机方向投影，得到 M 个 1D 标量序列
     2. 对每个 1D 序列计算 Epps-Pulley 正态性统计量（0~1，1表示完全正态）
@@ -40,11 +40,11 @@ class SIGRegLikeLoss(nn.Module):
         self._projection_matrix_cache = None
         self._d_model_cache = None
     
-    def _init_projections(self, d_model: int, device: torch.device):
+    def _init_projections(self, d_model: int, device: torch.device, dtype: torch.dtype):
         """延迟初始化投影矩阵（需要知道 d_model）"""
-        if self._projection_matrix_cache is not None:
-            return
-        
+        if self.seed is not None:
+            torch.manual_seed(self.seed)
+            
         # 生成 [num_projections, d_model] 的高斯随机矩阵
         # 每行是一个随机投影方向
         proj_matrix = torch.randn(self.num_projections, d_model, device=device)
@@ -54,7 +54,6 @@ class SIGRegLikeLoss(nn.Module):
         
         # 缓存到属性中
         self._projection_matrix_cache = proj_matrix
-        self._d_model_cache = d_model
     
     @staticmethod
     def epps_pulley_statistic(x: torch.Tensor) -> torch.Tensor:
@@ -118,8 +117,8 @@ class SIGRegLikeLoss(nn.Module):
         device = embedding.device
         
         # 初始化投影矩阵
-        if self._projection_matrix_cache is None:
-            self._init_projections(d_model, device)
+        if self._projection_matrix_cache is None or self._projection_matrix_cache.size(1) != d_model:
+            self._init_projections(d_model, device, embedding.dtype)
         
         # 应用掩码过滤有效位置
         if mask is not None:
@@ -127,46 +126,59 @@ class SIGRegLikeLoss(nn.Module):
             valid_mask = mask.view(b, seq_len, 1).expand_as(embedding)
             embedding_valid = embedding[valid_mask].view(-1, d_model)
         else:
-            embedding_valid = embedding.view(b * seq_len, d_model)
+            embedding_valid = embedding.view(-1, d_model)
+            
+        n_samples = embedding_valid.size(0)
         
-        if embedding_valid.size(0) < 2:
-            # 如果没有足够的有效样本，返回零损失
+        if n_samples < 2:
             loss = torch.tensor(0.0, device=device, dtype=embedding.dtype)
             if return_monitoring:
-                return loss, {"collapse_flag": False, "embed_std": 0.0}
+                return loss, {"collapse_flag": False, "embed_std": 0.0, "mean_normality": 0.0}
             return loss
+
+        # 对投影矩阵做类型匹配，防止 FP16 报错
+        assert self._projection_matrix_cache is not None
+        proj_matrix = self._projection_matrix_cache.to(dtype=embedding_valid.dtype)
         
-        # 计算 embedding 的标准差（用于监控坍塌）
-        embed_std = embedding_valid.std(dim=0).mean().item()
-        collapse_flag = embed_std < self.collapse_threshold
-        
-        # 进行 M 次随机投影
         # [num_projections, d_model] @ [d_model, N] -> [num_projections, N]
-        # 确保投影矩阵不为 None
-        assert self._projection_matrix_cache is not None, "投影矩阵应该已初始化"
-        projections = torch.mm(self._projection_matrix_cache, embedding_valid.t())  # [M, N]
+        projections = torch.mm(proj_matrix, embedding_valid.t())
         
-        # 计算每个投影的正态性统计量
-        normality_scores = []
-        for i in range(self.num_projections):
-            proj_1d = projections[i]  # [N]
-            score = self.epps_pulley_statistic(proj_1d)
-            normality_scores.append(score)
+        # 强制转为 FP32 进行统计学计算，彻底杜绝 NaN 和溢出
+        projections = projections.float()
         
-        # 平均正态性分数
-        mean_normality = torch.stack(normality_scores).mean()
+        embed_std = embedding_valid.float().std(dim=0).mean().item()
+        collapse_flag = embed_std < self.collapse_threshold
+
+        # 全向量化运算，避免 for 循环
+        # 1. 均值方差归一化
+        proj_mean = projections.mean(dim=1, keepdim=True)
+        proj_std = projections.std(dim=1, keepdim=True) + 1e-8
+        projections_norm = (projections - proj_mean) / proj_std
         
-        # 损失 = 1 - 平均正态性（最小化损失 = 最大化正态性）
-        loss = 1.0 - mean_normality
+        # 2. 批量排序 [num_projections, N]
+        sorted_projections, _ = torch.sort(projections_norm, dim=1)
+        
+        # 3. 计算理论分位数 (只需计算一次，广播到所有投影)
+        quantiles = torch.arange(1, n_samples + 1, dtype=torch.float32, device=device) / (n_samples + 1)
+        theoretical_quantiles = torch.erfinv(2 * quantiles - 1) * (2 ** 0.5)
+        theoretical_quantiles = theoretical_quantiles.unsqueeze(0) # [1, N]
+        
+        # 4. L2 距离与正态性得分
+        distances = torch.sqrt(((sorted_projections - theoretical_quantiles) ** 2).mean(dim=1) + 1e-8)
+        normality_scores = torch.exp(-distances)
+        
+        mean_normality = normality_scores.mean()
+        # 将 Loss 转回输入的数据类型 (如 FP16) 融入计算图
+        loss = (1.0 - mean_normality).to(dtype=embedding.dtype)
         
         if return_monitoring:
-            monitoring_dict: Dict[str, Any] = {
+            monitoring_dict = {
                 "collapse_flag": collapse_flag,
                 "embed_std": embed_std,
                 "mean_normality": mean_normality.item(),
             }
             return loss, monitoring_dict
-        
+            
         return loss
 
 

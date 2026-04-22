@@ -8,16 +8,7 @@ import math
 from tqdm import tqdm
 from typing import Optional
 
-# 导入 SIGReg-like 损失
-try:
-    from ..models.sigreg_loss import SIGRegLikeLoss
-except (ImportError, ValueError):
-    # 如果相对导入失败，尝试直接导入
-    import sys
-    from pathlib import Path
-    sigreg_path = Path(__file__).parent.parent / "models"
-    sys.path.insert(0, str(sigreg_path))
-    from sigreg_loss import SIGRegLikeLoss
+from src.models.sigreg_loss import SIGRegLikeLoss
 
 class ARTrainer:
     def __init__(
@@ -201,9 +192,12 @@ class ARTrainer:
                         # SIGReg-like 损失
                         sigreg_loss = logits.new_zeros(())
                         if self.enable_sigreg and sigreg_embedding is not None and self.sigreg_loss_fn is not None:
-                            # sigreg_embedding: [chunk_size, seq_len, d_model]
-                            # 构造对应的掩码（如果需要）
-                            sigreg_mask = None  # 默认不使用掩码，使用全部 embedding
+                            # 通过池化重建视觉 padding mask (True 表示图片有效区域)
+                            import torch.nn.functional as F
+                            with torch.no_grad():
+                                downsampled = F.max_pool2d(img_chunk, kernel_size=32, stride=32)
+                                sigreg_mask = (downsampled.view(img_chunk.size(0), -1) > 1e-5)
+                            
                             sigreg_loss = self.sigreg_loss_fn(sigreg_embedding, mask=sigreg_mask)
 
                         loss = (ce_loss + self.ctc_weight * ctc_loss + self.sigreg_weight * sigreg_loss) / chunks
