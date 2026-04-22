@@ -4,7 +4,7 @@ LaTeX OCR 主模型组装与 MLM 前向接口。
 import math
 import torch
 import torch.nn as nn
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple, Union, overload
 
 from .vision_encoder import ConvNeXtV2Encoder
 from .text_decoder import AttnResDecodeCache, AttnResTextDecoder
@@ -91,15 +91,35 @@ class LatexOCRModel(nn.Module):
         mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
         return mask
 
+    @overload
+    def encode(
+        self,
+        images: torch.Tensor,
+        return_aux: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]: ...
+
+    @overload
+    def encode(
+        self,
+        images: torch.Tensor,
+        return_aux: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]: ...
+
     def encode(
         self,
         images: torch.Tensor,
         return_aux: bool = False,
     ) -> Union[
         Tuple[torch.Tensor, torch.Tensor],
-        Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     ]:
-        """返回特征序列和 Padding 掩码"""
+        """
+        返回特征序列和 Padding 掩码
+        
+        Returns:
+            当 return_aux=False: (memory, memory_mask)
+            当 return_aux=True: (memory, memory_mask, ctc_logits, sigreg_embedding)
+        """
         return self.encoder(images, return_aux=return_aux)
 
     def precompute_cross_kv(self, memory: torch.Tensor):
@@ -206,14 +226,33 @@ class LatexOCRModel(nn.Module):
         tgt_seq: torch.Tensor,
         is_causal: bool = True,
         return_aux: bool = False,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """恢复为最简单的调用，不要在这里做 checkpoint"""
-        # 1. 默认路径保持原接口，仅在 return_aux=True 时返回额外分支
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """
+        前向传播
+        
+        Args:
+            images: [B, 1, H, W] 图像张量
+            tgt_seq: [B, T] 目标序列
+            is_causal: 是否使用因果掩码
+            return_aux: 是否返回辅助输出（CTC 和 SIGReg embedding）
+        
+        Returns:
+            return_aux=False: logits [B, T, vocab_size]
+            return_aux=True: (logits, ctc_logits, sigreg_embedding)
+        """
+        # 1. 获取编码器输出
+        encoder_output = self.encoder(images, return_aux=return_aux)
+        
+        # 2. 根据 return_aux 解包返回值
         ctc_logits: Optional[torch.Tensor] = None
+        sigreg_embedding: Optional[torch.Tensor] = None
+        
         if return_aux:
-            memory, memory_mask, ctc_logits = self.encode(images, return_aux=True)
+            # return_aux=True 时返回 4 元组: (memory, memory_mask, ctc_logits, sigreg_embedding)
+            memory, memory_mask, ctc_logits, sigreg_embedding = encoder_output
         else:
-            memory, memory_mask = self.encode(images, return_aux=False)
+            # return_aux=False 时返回 2 元组: (memory, memory_mask)
+            memory, memory_mask = encoder_output
 
         # 解码步骤
         tgt_key_padding_mask = (tgt_seq == self.pad_id)
@@ -233,6 +272,6 @@ class LatexOCRModel(nn.Module):
         )
 
         logits = self.head(decoder_out)
-        if return_aux and ctc_logits is not None:
-            return logits, ctc_logits
+        if return_aux and ctc_logits is not None and sigreg_embedding is not None:
+            return logits, ctc_logits, sigreg_embedding
         return logits

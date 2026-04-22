@@ -6,6 +6,18 @@ import torch
 import torch.nn as nn
 import math
 from tqdm import tqdm
+from typing import Optional
+
+# 导入 SIGReg-like 损失
+try:
+    from ..models.sigreg_loss import SIGRegLikeLoss
+except (ImportError, ValueError):
+    # 如果相对导入失败，尝试直接导入
+    import sys
+    from pathlib import Path
+    sigreg_path = Path(__file__).parent.parent / "models"
+    sys.path.insert(0, str(sigreg_path))
+    from sigreg_loss import SIGRegLikeLoss
 
 class ARTrainer:
     def __init__(
@@ -23,6 +35,10 @@ class ARTrainer:
         ctc_weight=0.5,
         ohem_ratio=0.5,
         ema_model=None,
+        enable_sigreg: bool = False,
+        sigreg_weight: float = 0.1,
+        sigreg_num_projections: int = 1024,
+        sigreg_collapse_threshold: float = 0.01,
     ):
         """
         Args:
@@ -34,6 +50,10 @@ class ARTrainer:
             amp_enabled: 是否启用 autocast
             amp_dtype: autocast 使用的精度类型
             label_smoothing: 交叉熵标签平滑系数
+            enable_sigreg: 是否启用 SIGReg-like 辅助损失
+            sigreg_weight: SIGReg 损失权重
+            sigreg_num_projections: SIGReg 随机投影次数
+            sigreg_collapse_threshold: embedding 坍塌检测阈值
         """
         self.model = model
         self.optimizer = optimizer
@@ -47,6 +67,17 @@ class ARTrainer:
         self.ctc_weight = float(ctc_weight)
         self.ohem_ratio = float(ohem_ratio)
         self.ema_model = ema_model
+        
+        # SIGReg-like 参数
+        self.enable_sigreg = bool(enable_sigreg)
+        self.sigreg_weight = float(sigreg_weight)
+        self.sigreg_loss_fn: Optional[SIGRegLikeLoss] = None
+        if self.enable_sigreg and self.sigreg_weight > 0:
+            self.sigreg_loss_fn = SIGRegLikeLoss(
+                num_projections=int(sigreg_num_projections),
+                collapse_threshold=float(sigreg_collapse_threshold),
+                seed=None,
+            ).to(device)
         if not (0.0 <= self.label_smoothing < 1.0):
             raise ValueError(f"label_smoothing 必须在 [0,1) 区间，当前为 {self.label_smoothing}")
         if not (0.0 < self.ohem_ratio <= 1.0):
@@ -69,6 +100,7 @@ class ARTrainer:
     def _compute_ctc_loss(
         self,
         ctc_logits: torch.Tensor,
+        image_chunk: torch.Tensor,
         ar_targets: torch.Tensor,
         valid_mask: torch.Tensor,
     ) -> torch.Tensor:
@@ -76,12 +108,14 @@ class ARTrainer:
             return ctc_logits.new_zeros(())
 
         time_steps, batch_size, _ = ctc_logits.size()
-        input_lengths = torch.full(
-            (batch_size,),
-            fill_value=time_steps,
-            dtype=torch.long,
-            device=ctc_logits.device,
-        )
+        with torch.no_grad():
+            # 基于真实图像有效列估计 CTC 时间长度，减少对右侧纯 padding 区域的冗余 blank 拟合。
+            import torch.nn.functional as F
+
+            downsampled = F.max_pool2d(image_chunk, kernel_size=32, stride=32)
+            valid_cols = (downsampled.squeeze(1) > 1e-5).any(dim=1)
+            input_lengths = valid_cols.sum(dim=1).to(device=ctc_logits.device, dtype=torch.long)
+            input_lengths = input_lengths.clamp(min=1, max=time_steps)
 
         target_chunks = []
         target_lengths_list = []
@@ -97,19 +131,23 @@ class ARTrainer:
             return ctc_logits.new_zeros(())
 
         targets = torch.cat([row for row in target_chunks if row.numel() > 0], dim=0).to(dtype=torch.long)
-        log_probs = ctc_logits.log_softmax(dim=-1)
+        # 强制使用 FP32 执行 CTC 的 log_softmax，避免 AMP(fp16) 下数值下溢导致 NaN。
+        log_probs = ctc_logits.float().log_softmax(dim=-1)
         return self.ctc_criterion(log_probs, targets, input_lengths, target_lengths)
 
-    def _optimizer_step(self) -> None:
+    def _optimizer_step(self) -> bool:
         if self.scaler is not None:
+            old_scale = float(self.scaler.get_scale())
             self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.scaler.step(self.optimizer)
             self.scaler.update()
+            new_scale = float(self.scaler.get_scale())
+            return new_scale >= old_scale
         else:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
-
+            return True
     def _train_step_with_retry(self, images, ar_inputs, ar_targets):
         """
         独立封装的动态微批次与 OOM 拦截引擎。
@@ -126,6 +164,7 @@ class ARTrainer:
                 batch_loss_sum = 0.0
                 batch_ce_sum = 0.0
                 batch_ctc_sum = 0.0
+                batch_sigreg_sum = 0.0
                 batch_acc_sum = 0.0
 
                 for i in range(0, batch_size, chunk_size):
@@ -136,10 +175,13 @@ class ARTrainer:
                     with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.amp_enabled):
                         outputs = self.model(images=img_chunk, tgt_seq=ar_in_chunk, is_causal=True, return_aux=True)
                         if isinstance(outputs, tuple):
-                            logits, ctc_logits = outputs
+                            logits = outputs[0]
+                            ctc_logits = outputs[1] if len(outputs) > 1 else None
+                            sigreg_embedding = outputs[2] if len(outputs) > 2 else None
                         else:
                             logits = outputs
                             ctc_logits = None
+                            sigreg_embedding = None
 
                         vocab_size = logits.size(-1)
                         token_losses = self.criterion(logits.view(-1, vocab_size), ar_tgt_chunk.view(-1))
@@ -154,9 +196,17 @@ class ARTrainer:
 
                         ctc_loss = logits.new_zeros(())
                         if ctc_logits is not None:
-                            ctc_loss = self._compute_ctc_loss(ctc_logits, ar_tgt_chunk, valid_mask)
+                            ctc_loss = self._compute_ctc_loss(ctc_logits, img_chunk, ar_tgt_chunk, valid_mask)
 
-                        loss = (ce_loss + self.ctc_weight * ctc_loss) / chunks
+                        # SIGReg-like 损失
+                        sigreg_loss = logits.new_zeros(())
+                        if self.enable_sigreg and sigreg_embedding is not None and self.sigreg_loss_fn is not None:
+                            # sigreg_embedding: [chunk_size, seq_len, d_model]
+                            # 构造对应的掩码（如果需要）
+                            sigreg_mask = None  # 默认不使用掩码，使用全部 embedding
+                            sigreg_loss = self.sigreg_loss_fn(sigreg_embedding, mask=sigreg_mask)
+
+                        loss = (ce_loss + self.ctc_weight * ctc_loss + self.sigreg_weight * sigreg_loss) / chunks
 
                     if self.scaler is not None:
                         self.scaler.scale(loss).backward()
@@ -172,13 +222,15 @@ class ARTrainer:
                     batch_loss_sum += loss.item() * chunks
                     batch_ce_sum += ce_loss.item()
                     batch_ctc_sum += ctc_loss.item()
+                    batch_sigreg_sum += sigreg_loss.item() if self.enable_sigreg else 0.0
                     batch_acc_sum += chunk_acc * (img_chunk.size(0) / batch_size)
 
-                self._optimizer_step()
-                self.scheduler.step()
+                optimizer_stepped = self._optimizer_step()
+                if optimizer_stepped:
+                    self.scheduler.step()
                 if self.ema_model is not None:
                     self.ema_model.update_parameters(self.model)
-                return batch_loss_sum, batch_ce_sum, batch_ctc_sum, batch_acc_sum, True
+                return batch_loss_sum, batch_ce_sum, batch_ctc_sum, batch_sigreg_sum, batch_acc_sum, True
 
             except torch.cuda.OutOfMemoryError:
                 try:
@@ -206,6 +258,7 @@ class ARTrainer:
         total_loss = 0.0
         total_ce = 0.0
         total_ctc = 0.0
+        total_sigreg = 0.0
         total_acc = 0.0
         valid_batches = 0
         
@@ -225,7 +278,7 @@ class ARTrainer:
                 if self.target_ignore_index != self.pad_id:
                     ar_targets = ar_targets.masked_fill(ar_targets == self.pad_id, self.target_ignore_index)
 
-            batch_loss_sum, batch_ce_sum, batch_ctc_sum, batch_acc_sum, success = self._train_step_with_retry(images, ar_inputs, ar_targets)
+            batch_loss_sum, batch_ce_sum, batch_ctc_sum, batch_sigreg_sum, batch_acc_sum, success = self._train_step_with_retry(images, ar_inputs, ar_targets)
 
             if not success:
                 continue
@@ -233,6 +286,7 @@ class ARTrainer:
             total_loss += batch_loss_sum
             total_ce += batch_ce_sum
             total_ctc += batch_ctc_sum
+            total_sigreg += batch_sigreg_sum
             total_acc += batch_acc_sum
             valid_batches += 1
             
@@ -242,11 +296,15 @@ class ARTrainer:
                         "Loss": f"{batch_loss_sum:.3f}",
                         "CE": f"{batch_ce_sum:.3f}",
                         "CTC": f"{batch_ctc_sum:.3f}",
+                        "SIGReg": f"{batch_sigreg_sum:.3f}" if self.enable_sigreg else "N/A",
                         "Acc": f"{batch_acc_sum*100:.1f}%",
                         "LR": f"{self.scheduler.get_last_lr()[0]:.2e}",
                     }
                 )
                 
         avg_loss = total_loss / valid_batches if valid_batches > 0 else 0.0
+        avg_ce = total_ce / valid_batches if valid_batches > 0 else 0.0
+        avg_ctc = total_ctc / valid_batches if valid_batches > 0 else 0.0
+        avg_sigreg = total_sigreg / valid_batches if valid_batches > 0 else 0.0
         avg_acc = total_acc / valid_batches if valid_batches > 0 else 0.0
-        return avg_loss, avg_acc
+        return avg_loss, avg_ce, avg_ctc, avg_sigreg, avg_acc

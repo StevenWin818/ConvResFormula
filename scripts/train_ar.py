@@ -87,6 +87,14 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--weight_decay", type=float, default=None, help=h("weight_decay", "权重衰减系数"))
 	parser.add_argument("--ctc_weight", type=float, default=None, help="CTC 辅助损失权重")
 	parser.add_argument("--ohem_ratio", type=float, default=None, help="OHEM 困难样本保留比例")
+	
+	# SIGReg-like 参数
+	parser.add_argument("--enable_sigreg", dest="enable_sigreg", action="store_true", help="启用 SIGReg-like 正则化")
+	parser.add_argument("--disable_sigreg", dest="enable_sigreg", action="store_false", help="禁用 SIGReg-like 正则化")
+	parser.set_defaults(enable_sigreg=None)
+	parser.add_argument("--sigreg_weight", type=float, default=None, help="SIGReg-like 损失权重")
+	parser.add_argument("--sigreg_num_projections", type=int, default=None, help="SIGReg 随机投影次数")
+	parser.add_argument("--sigreg_collapse_threshold", type=float, default=None, help="SIGReg embedding 坍塌检测阈值")
 
 	parser.add_argument("--warmup_epochs", type=float, default=None, help=h("warmup_epochs", "学习率 warmup 轮数"))
 	parser.add_argument("--warmup_start_lr", type=float, default=None, help=h("warmup_start_lr", "warmup 起始学习率"))
@@ -213,6 +221,13 @@ def apply_config_defaults(args: argparse.Namespace, train_cfg: Dict[str, Any], m
 	args.weight_decay = args.weight_decay if args.weight_decay is not None else float(_cfg_get(train_cfg, ("optimization", "weight_decay"), 1e-2))
 	args.ctc_weight = args.ctc_weight if args.ctc_weight is not None else float(_cfg_get(train_cfg, ("optimization", "ctc_weight"), 0.5))
 	args.ohem_ratio = args.ohem_ratio if args.ohem_ratio is not None else float(_cfg_get(train_cfg, ("optimization", "ohem_ratio"), 0.5))
+	
+	# SIGReg-like 参数
+	if args.enable_sigreg is None:
+		args.enable_sigreg = bool(_cfg_get(train_cfg, ("optimization", "enable_sigreg"), False))
+	args.sigreg_weight = args.sigreg_weight if args.sigreg_weight is not None else float(_cfg_get(train_cfg, ("optimization", "sigreg_weight"), 0.1))
+	args.sigreg_num_projections = args.sigreg_num_projections if args.sigreg_num_projections is not None else int(_cfg_get(train_cfg, ("optimization", "sigreg_num_projections"), 1024))
+	args.sigreg_collapse_threshold = args.sigreg_collapse_threshold if args.sigreg_collapse_threshold is not None else float(_cfg_get(train_cfg, ("optimization", "sigreg_collapse_threshold"), 0.01))
 
 	args.warmup_epochs = args.warmup_epochs if args.warmup_epochs is not None else float(_cfg_get(train_cfg, ("scheduler", "warmup_epochs"), 1.0))
 	args.warmup_start_lr = args.warmup_start_lr if args.warmup_start_lr is not None else float(_cfg_get(train_cfg, ("scheduler", "warmup_start_lr"), 1e-7))
@@ -715,7 +730,7 @@ def batched_infer_ar(
 
 	# 视觉特征在一次迭代解码中不变，仅提取一次并复用
 	with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
-		memory, memory_padding_mask = model.encode(images)
+		memory, memory_padding_mask = model.encode(images, return_aux=False)
 		decode_cache = model.init_decode_cache(memory)
 
 	generated = torch.full((batch_size, max_len), pad_id, dtype=torch.long, device=device)
@@ -1175,11 +1190,15 @@ def main() -> None:
 		ctc_weight=args.ctc_weight,
 		ohem_ratio=args.ohem_ratio,
 		ema_model=ema_model,
+		enable_sigreg=bool(args.enable_sigreg),
+		sigreg_weight=float(args.sigreg_weight),
+		sigreg_num_projections=int(args.sigreg_num_projections),
+		sigreg_collapse_threshold=float(args.sigreg_collapse_threshold),
 	)
 
 	if not os.path.exists(log_path):
 		with open(log_path, "w", encoding="utf-8") as f:
-			f.write("Timestamp\tEpoch\tLoss\tTokenAcc(%)\tEvalProcessed\tEvalExact\tEvalEM(%)\tEvalNED\tLREnc\tLRDec\n")
+			f.write("Timestamp\tEpoch\tLoss\tCE\tCTC\tSIGReg\tTokenAcc(%)\tEvalProcessed\tEvalExact\tEvalEM(%)\tEvalNED\tLREnc\tLRDec\n")
 
 	print("=" * 80)
 	print(
@@ -1200,6 +1219,10 @@ def main() -> None:
 		f"channels_last={bool(args.channels_last)} | "
 		f"KernelWarmupBatches={args.kernel_warmup_batches}"
 	)
+	if args.enable_sigreg:
+		print(f"SIGReg: Enabled | Weight={args.sigreg_weight} | NumProjections={args.sigreg_num_projections} | CollapseThreshold={args.sigreg_collapse_threshold}")
+	else:
+		print(f"SIGReg: Disabled")
 	if not args.skip_eval:
 		print(f"EvalSet={args.eval_h5} | EvalBatch={args.eval_batch_size} | EvalSamples={args.eval_samples}")
 	print(f"Total Steps={total_steps}, Warmup Steps={warmup_steps}")
@@ -1220,7 +1243,7 @@ def main() -> None:
 
 	for epoch in range(start_epoch, args.epochs + 1):
 		train_batch_sampler.set_epoch(epoch)
-		avg_loss, avg_acc = trainer.train_epoch(train_loader, epoch=epoch, log_interval=args.log_interval)
+		avg_loss, avg_ce, avg_ctc, avg_sigreg, avg_acc = trainer.train_epoch(train_loader, epoch=epoch, log_interval=args.log_interval)
 
 		eval_processed = 0.0
 		eval_exact = 0.0
@@ -1264,7 +1287,7 @@ def main() -> None:
 		timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 		with open(log_path, "a", encoding="utf-8") as f:
 			f.write(
-				f"{timestamp}\t{epoch}\t{avg_loss:.6f}\t{avg_acc * 100:.4f}\t"
+				f"{timestamp}\t{epoch}\t{avg_loss:.6f}\t{avg_ce:.6f}\t{avg_ctc:.6f}\t{avg_sigreg:.6f}\t{avg_acc * 100:.4f}\t"
 				f"{int(eval_processed)}\t{int(eval_exact)}\t{eval_em * 100:.4f}\t{eval_ned:.6f}\t"
 				f"{lr_enc:.8e}\t{lr_dec:.8e}\n"
 			)

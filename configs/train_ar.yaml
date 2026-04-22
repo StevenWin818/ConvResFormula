@@ -24,6 +24,10 @@ optimization:
   label_smoothing: 0.1 # 交叉熵标签平滑，提升泛化能力
   ctc_weight: 0.5 # CTC 辅助损失权重
   ohem_ratio: 0.5 # OHEM 困难样本保留比例
+  enable_sigreg: false # 是否启用 SIGReg-like 正则化
+  sigreg_weight: 0.1 # SIGReg-like 损失权重
+  sigreg_num_projections: 1024 # SIGReg 随机投影次数
+  sigreg_collapse_threshold: 0.01 # SIGReg embedding 坍塌检测阈值
 
 augmentation:
   enable: true
@@ -71,7 +75,7 @@ eval:
 runtime:
   ckpt_dir: checkpoints/ar # checkpoint 输出目录
   log_dir: logs/ar_logs # 日志输出目录
-  resume_ckpt: checkpoints\ar\epoch_15_stripped.pth # 恢复训练使用的 checkpoint
+  resume_ckpt: checkpoints\ar\epoch_2.pth # 恢复训练使用的 checkpoint
   resume: True # 是否默认启用断点恢复
   amp_dtype: fp16 # 训练精度类型(fp16/bf16/fp32)
   cudnn_benchmark: True # 启用 cudnn benchmark 模式以优化卷积性能

@@ -4,7 +4,7 @@ ConvNeXt-V2 视觉编码器接口。
 """
 
 import math
-from typing import Any, Optional, Tuple, Union
+from typing import Any, Callable, Optional, Tuple, Union, cast
 
 import torch
 import torch.nn as nn
@@ -83,8 +83,10 @@ class ConvNeXtV2Encoder(nn.Module):
         )
 
         # 通过开关控制 timm 原生细粒度梯度检查点（Stage/Layer 内部分段释放）
-        if hasattr(self.backbone, "set_grad_checkpointing"):
-            self.backbone.set_grad_checkpointing(bool(use_gradient_checkpointing))
+        set_grad_checkpointing = getattr(self.backbone, "set_grad_checkpointing", None)
+        if callable(set_grad_checkpointing):
+            set_grad_checkpointing_fn = cast(Callable[[bool], Any], set_grad_checkpointing)
+            set_grad_checkpointing_fn(bool(use_gradient_checkpointing))
             if bool(use_gradient_checkpointing):
                 print("✅ 视觉主干网络内部 Layer-level 梯度检查点已激活！")
             else:
@@ -114,6 +116,7 @@ class ConvNeXtV2Encoder(nn.Module):
     ) -> Union[
         Tuple[torch.Tensor, torch.Tensor],
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     ]:
         """
         Args:
@@ -151,9 +154,9 @@ class ConvNeXtV2Encoder(nn.Module):
 
         # 5. 展平为 1D 序列 (从 2D 图变为文字序列一样的排布)
         # [Batch, d_model, H_feat, W_feat] -> [Batch, d_model, H_feat * W_feat] -> [Batch, Seq_Len, d_model]
-        features = features.flatten(2).permute(0, 2, 1)
-
+        sigreg_embedding = features.flatten(2).permute(0, 2, 1)  # [B, Seq_Len, d_model]
+        
         if return_aux and ctc_logits is not None:
-            return features, memory_padding_mask, ctc_logits
+            return sigreg_embedding, memory_padding_mask, ctc_logits, sigreg_embedding
 
-        return features, memory_padding_mask
+        return sigreg_embedding, memory_padding_mask
