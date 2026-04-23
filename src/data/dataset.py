@@ -41,6 +41,8 @@ class FormulaDataset(Dataset):
         max_area: int = 98304,
         enable_augment: bool = False,
         augment_config: Optional[Dict[str, Any]] = None,
+        enable_extreme_augment: bool = False,
+        extreme_augment_config: Optional[Dict[str, Any]] = None,
     ):
         """
         Args:
@@ -53,6 +55,8 @@ class FormulaDataset(Dataset):
         self.max_area = max_area
         self.enable_augment = bool(enable_augment)
         self.augment_config = augment_config if isinstance(augment_config, dict) else {}
+        self.enable_extreme_augment = bool(enable_extreme_augment)
+        self.extreme_augment_config = extreme_augment_config if isinstance(extreme_augment_config, dict) else {}
         
         # 加载 BPE 分词器
         self.tokenizer = Tokenizer.from_file(tokenizer_path)
@@ -103,11 +107,11 @@ class FormulaDataset(Dataset):
         return str(raw)
 
     def _build_albu_transform(self):
-        if (not self.enable_augment) or A is None:
+        if (not self.enable_extreme_augment) or A is None:
             return None
 
-        grid_cfg = self.augment_config.get("grid_distortion", {})
-        elastic_cfg = self.augment_config.get("elastic_transform", {})
+        grid_cfg = self.extreme_augment_config.get("grid_distortion", {})
+        elastic_cfg = self.extreme_augment_config.get("elastic_transform", {})
 
         transforms = [
             A.GridDistortion(
@@ -125,7 +129,10 @@ class FormulaDataset(Dataset):
         return A.Compose(transforms)
 
     def _apply_morphology(self, img: np.ndarray) -> np.ndarray:
-        morph_cfg = self.augment_config.get("morphology", {})
+        if not self.enable_extreme_augment:
+            return img
+
+        morph_cfg = self.extreme_augment_config.get("morphology", {})
         prob = float(morph_cfg.get("prob", 0.4))
         if np.random.rand() >= prob:
             return img
@@ -213,9 +220,9 @@ class FormulaDataset(Dataset):
 
             img = np.clip(img_float, 0.0, 255.0).astype(np.uint8)
 
+        if self.enable_extreme_augment:
             if self.albu_transform is not None:
                 img = self.albu_transform(image=img)["image"]
-
             img = self._apply_morphology(img)
             
         # 转换为 Tensor，归一化到 [0, 1] 并增加通道维度 [1, H, W]

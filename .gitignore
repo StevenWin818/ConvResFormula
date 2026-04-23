@@ -58,6 +58,6 @@ pip-wheel-metadata/
 .github/copilot-instructions.md
 
 node_modules
-*.json、
+*.json
 
 test_*.py

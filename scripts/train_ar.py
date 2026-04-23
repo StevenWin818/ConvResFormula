@@ -81,11 +81,15 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--mix_ratio", type=int, nargs="+", default=None, help=h("mix_ratio", "多数据源采样比例，例如 1 1 5"))
 	parser.add_argument("--epoch_samples", type=int, default=None, help=h("epoch_samples", "每个 epoch 总采样数，<=0 使用全量"))
 	parser.add_argument("--bucket_mega_factor", type=int, default=None, help=h("bucket_mega_factor", "分桶 mega-batch 系数"))
+	parser.add_argument("--enable_extreme_augment", dest="enable_extreme_augment", action="store_true", help="启用极端数据增强（形态学/网格扭曲等）")
+	parser.add_argument("--disable_extreme_augment", dest="enable_extreme_augment", action="store_false", help="禁用极端数据增强（独立于标准增强）")
+	parser.set_defaults(enable_extreme_augment=None)
 
 	parser.add_argument("--encoder_lr", type=float, default=None, help=h("encoder_lr", "视觉编码器学习率"))
 	parser.add_argument("--decoder_lr", type=float, default=None, help=h("decoder_lr", "解码器学习率"))
 	parser.add_argument("--weight_decay", type=float, default=None, help=h("weight_decay", "权重衰减系数"))
-	parser.add_argument("--ctc_weight", type=float, default=None, help="CTC 辅助损失权重")
+	parser.add_argument("--bow_weight", type=float, default=None, help="BoW 辅助损失权重")
+	parser.add_argument("--ctc_weight", type=float, default=None, help="[兼容旧参数] 等价映射到 bow_weight")
 	parser.add_argument("--ohem_ratio", type=float, default=None, help="OHEM 困难样本保留比例")
 	
 	# SIGReg-like 参数
@@ -219,7 +223,12 @@ def apply_config_defaults(args: argparse.Namespace, train_cfg: Dict[str, Any], m
 	args.encoder_lr = args.encoder_lr if args.encoder_lr is not None else float(_cfg_get(train_cfg, ("optimization", "encoder_lr"), 5e-5))
 	args.decoder_lr = args.decoder_lr if args.decoder_lr is not None else float(_cfg_get(train_cfg, ("optimization", "decoder_lr"), 1e-4))
 	args.weight_decay = args.weight_decay if args.weight_decay is not None else float(_cfg_get(train_cfg, ("optimization", "weight_decay"), 1e-2))
-	args.ctc_weight = args.ctc_weight if args.ctc_weight is not None else float(_cfg_get(train_cfg, ("optimization", "ctc_weight"), 0.5))
+	if args.bow_weight is not None:
+		args.bow_weight = float(args.bow_weight)
+	elif args.ctc_weight is not None:
+		args.bow_weight = float(args.ctc_weight)
+	else:
+		args.bow_weight = float(_cfg_get(train_cfg, ("optimization", "bow_weight"), _cfg_get(train_cfg, ("optimization", "ctc_weight"), 0.5)))
 	args.ohem_ratio = args.ohem_ratio if args.ohem_ratio is not None else float(_cfg_get(train_cfg, ("optimization", "ohem_ratio"), 0.5))
 	
 	# SIGReg-like 参数
@@ -240,6 +249,13 @@ def apply_config_defaults(args: argparse.Namespace, train_cfg: Dict[str, Any], m
 		augment_cfg = {}
 	args.enable_augment = bool(augment_cfg.get("enable", True))
 	args.augmentation_cfg = augment_cfg
+
+	extreme_augment_cfg = _cfg_get(train_cfg, ("augmentation_extreme",), {})
+	if not isinstance(extreme_augment_cfg, dict):
+		extreme_augment_cfg = {}
+	if args.enable_extreme_augment is None:
+		args.enable_extreme_augment = bool(extreme_augment_cfg.get("enable", False))
+	args.extreme_augmentation_cfg = extreme_augment_cfg
 
 	args.log_interval = args.log_interval if args.log_interval is not None else int(_cfg_get(train_cfg, ("logging", "log_interval"), 20))
 	args.eval_interval = args.eval_interval if args.eval_interval is not None else int(_cfg_get(train_cfg, ("eval", "eval_interval"), 1))
@@ -953,6 +969,8 @@ def main() -> None:
 			max_area=args.max_area,
 			enable_augment=args.enable_augment,
 			augment_config=args.augmentation_cfg,
+			enable_extreme_augment=bool(args.enable_extreme_augment),
+			extreme_augment_config=args.extreme_augmentation_cfg,
 		)
 		for path in dataset_paths
 	]
@@ -1117,7 +1135,7 @@ def main() -> None:
 		model_state_dict = convert_legacy_attnres_state_dict(state_dict)
 		incompatible = model.load_state_dict(model_state_dict, strict=False)
 		if incompatible.missing_keys:
-			print(f"警告: checkpoint 缺少 {len(incompatible.missing_keys)} 个参数（含新增 CTC 头时属正常）。")
+			print(f"警告: checkpoint 缺少 {len(incompatible.missing_keys)} 个参数（含新增 BoW 头时属正常）。")
 		if incompatible.unexpected_keys:
 			print(f"警告: checkpoint 存在 {len(incompatible.unexpected_keys)} 个未使用参数。")
 
@@ -1187,7 +1205,7 @@ def main() -> None:
 		channels_last=bool(args.channels_last),
 		label_smoothing=args.label_smoothing,
 		target_ignore_index=-100,
-		ctc_weight=args.ctc_weight,
+		bow_weight=args.bow_weight,
 		ohem_ratio=args.ohem_ratio,
 		ema_model=ema_model,
 		enable_sigreg=bool(args.enable_sigreg),
@@ -1198,7 +1216,7 @@ def main() -> None:
 
 	if not os.path.exists(log_path):
 		with open(log_path, "w", encoding="utf-8") as f:
-			f.write("Timestamp\tEpoch\tLoss\tCE\tCTC\tSIGReg\tTokenAcc(%)\tEvalProcessed\tEvalExact\tEvalEM(%)\tEvalNED\tLREnc\tLRDec\n")
+			f.write("Timestamp\tEpoch\tLoss\tCE\tBoW\tSIGReg\tTokenAcc(%)\tEvalProcessed\tEvalExact\tEvalEM(%)\tEvalNED\tLREnc\tLRDec\n")
 
 	print("=" * 80)
 	print(
@@ -1217,7 +1235,8 @@ def main() -> None:
 		f"cudnn.benchmark={torch.backends.cudnn.benchmark} | "
 		f"cudnn.deterministic={torch.backends.cudnn.deterministic} | "
 		f"channels_last={bool(args.channels_last)} | "
-		f"KernelWarmupBatches={args.kernel_warmup_batches}"
+		f"KernelWarmupBatches={args.kernel_warmup_batches} | "
+		f"ExtremeAugment={bool(args.enable_extreme_augment)}"
 	)
 	if args.enable_sigreg:
 		print(f"SIGReg: Enabled | Weight={args.sigreg_weight} | NumProjections={args.sigreg_num_projections} | CollapseThreshold={args.sigreg_collapse_threshold}")
@@ -1243,7 +1262,7 @@ def main() -> None:
 
 	for epoch in range(start_epoch, args.epochs + 1):
 		train_batch_sampler.set_epoch(epoch)
-		avg_loss, avg_ce, avg_ctc, avg_sigreg, avg_acc = trainer.train_epoch(train_loader, epoch=epoch, log_interval=args.log_interval)
+		avg_loss, avg_ce, avg_bow, avg_sigreg, avg_acc = trainer.train_epoch(train_loader, epoch=epoch, log_interval=args.log_interval)
 
 		eval_processed = 0.0
 		eval_exact = 0.0
@@ -1287,7 +1306,7 @@ def main() -> None:
 		timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 		with open(log_path, "a", encoding="utf-8") as f:
 			f.write(
-				f"{timestamp}\t{epoch}\t{avg_loss:.6f}\t{avg_ce:.6f}\t{avg_ctc:.6f}\t{avg_sigreg:.6f}\t{avg_acc * 100:.4f}\t"
+				f"{timestamp}\t{epoch}\t{avg_loss:.6f}\t{avg_ce:.6f}\t{avg_bow:.6f}\t{avg_sigreg:.6f}\t{avg_acc * 100:.4f}\t"
 				f"{int(eval_processed)}\t{int(eval_exact)}\t{eval_em * 100:.4f}\t{eval_ned:.6f}\t"
 				f"{lr_enc:.8e}\t{lr_dec:.8e}\n"
 			)
@@ -1338,6 +1357,11 @@ def main() -> None:
 		if is_best_loss:
 			torch.save(ckpt_payload, best_loss_ckpt)
 			print(f"更新最小训练损失: {best_loss:.4f}")
+
+		# 强制清空显存碎片，为下一个 Epoch 准备更连续的可用显存
+		if torch.cuda.is_available():
+			torch.cuda.empty_cache()
+		print(f"Epoch {epoch} 结束，准备进入下一轮...")
 
 	print("\nAR 训练完成。")
 

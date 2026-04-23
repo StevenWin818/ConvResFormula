@@ -105,8 +105,8 @@ class ConvNeXtV2Encoder(nn.Module):
         # 注意：这里的 max_h 和 max_w 是指“特征图”的最大尺寸。
         self.pos_encoder = PositionalEncoding2D(d_model=d_model, max_h=128, max_w=1024)
 
-        # 4. CTC 辅助头：将宽度序列映射到词表（含 blank）
-        self.ctc_head = nn.Linear(d_model, int(ctc_vocab_size))
+        # 4. BoW 辅助头：预测图像中各符号是否出现（多标签）
+        self.bow_head = nn.Linear(d_model, int(ctc_vocab_size))
 
     def forward(
         self,
@@ -145,18 +145,17 @@ class ConvNeXtV2Encoder(nn.Module):
             downsampled_mask = F.max_pool2d(x, kernel_size=32, stride=32)
             memory_padding_mask = (downsampled_mask.view(b, -1) <= 1e-5)
 
-        ctc_logits = None
+        bow_logits = None
         if return_aux:
-            # CTC 分支按高度池化成宽度序列: [B, C, H, W] -> [B, W, C]
-            ctc_memory = features.mean(dim=2).permute(0, 2, 1).contiguous()
-            # CTCLoss 使用 [T, B, C] 排布
-            ctc_logits = self.ctc_head(ctc_memory).permute(1, 0, 2).contiguous()
+            # 全局平均池化得到 [B, d_model]，用于符号存在性预测
+            global_feat = features.mean(dim=(2, 3))
+            bow_logits = self.bow_head(global_feat)
 
         # 5. 展平为 1D 序列 (从 2D 图变为文字序列一样的排布)
         # [Batch, d_model, H_feat, W_feat] -> [Batch, d_model, H_feat * W_feat] -> [Batch, Seq_Len, d_model]
         sigreg_embedding = features.flatten(2).permute(0, 2, 1)  # [B, Seq_Len, d_model]
         
-        if return_aux and ctc_logits is not None:
-            return sigreg_embedding, memory_padding_mask, ctc_logits, sigreg_embedding
+        if return_aux and bow_logits is not None:
+            return sigreg_embedding, memory_padding_mask, bow_logits, sigreg_embedding
 
         return sigreg_embedding, memory_padding_mask

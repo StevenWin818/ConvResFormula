@@ -4,7 +4,7 @@ data:
     - C:/Projects/LatexProject/ConvResFormula/datasets/synthetic.h5 # 合成训练集
     - C:/Projects/LatexProject/ConvResFormula/datasets/symbols96.h5 # 单字符训练集
     - C:/Projects/LatexProject/ConvResFormula/datasets/wiki_train_314k.h5 # wiki训练集
-  eval_h5: C:/Projects/LatexProject/ConvResFormula/datasets/val.h5 # 验证/评估集
+  eval_h5: C:/Projects/LatexProject/ConvResFormula/datasets/wiki_eval_5k.h5 # 验证/评估集
   tokenizer: C:/Projects/LatexProject/ConvResFormula/tokenizer_bpe.json # BPE 分词器
   max_area: 98304 # 图像动态缩放的面积上限
 
@@ -13,19 +13,19 @@ training:
   num_workers: 4 # 训练 DataLoader 线程数
   epochs: 18 # 总训练轮数
   seed: 42 # 随机种子
-  mix_ratio: [4, 3, 1, 2] # 多数据源采样比例，真实手写:合成手写:单字符手写:wiki
-  epoch_samples: 524288 # 每个 epoch 的采样总数，<=0 表示全量
+  mix_ratio: [0, 0, 0,1] # 多数据源采样比例，真实手写:合成手写:单字符手写:wiki
+  epoch_samples: 318400 # 每个 epoch 的采样总数，<=0 表示全量
   bucket_mega_factor: 64 # 分桶 mega-batch 系数
 
 optimization:
-  encoder_lr: 5.0e-5 # 编码器学习率
-  decoder_lr: 2.0e-5 # 解码器学习率
+  encoder_lr: 7.0e-5 # 编码器学习率
+  decoder_lr: 1.0e-4 # 解码器学习率
   weight_decay: 1.0e-2 # AdamW 权重衰减
   label_smoothing: 0.1 # 交叉熵标签平滑，提升泛化能力
-  ctc_weight: 0.5 # CTC 辅助损失权重
-  ohem_ratio: 0.5 # OHEM 困难样本保留比例
-  enable_sigreg: false # 是否启用 SIGReg-like 正则化
-  sigreg_weight: 0.1 # SIGReg-like 损失权重
+  bow_weight: 1.0 # BoW 辅助损失权重
+  ohem_ratio: 1.0 # OHEM 困难样本保留比例，设为 1.0 即不使用 OHEM
+  enable_sigreg: true # 是否启用 SIGReg-like 正则化
+  sigreg_weight: 0.01 # SIGReg-like 损失权重
   sigreg_num_projections: 1024 # SIGReg 随机投影次数
   sigreg_collapse_threshold: 0.01 # SIGReg embedding 坍塌检测阈值
 
@@ -39,6 +39,9 @@ augmentation:
     prob: 0.3
     alpha_min: 0.7
     alpha_max: 1.2
+
+augmentation_extreme:  
+  enable: false  # 是否启用极限增强，极限增强包含更激烈的变换
   grid_distortion:
     prob: 0.5
     num_steps: 5
@@ -75,7 +78,7 @@ eval:
 runtime:
   ckpt_dir: checkpoints/ar # checkpoint 输出目录
   log_dir: logs/ar_logs # 日志输出目录
-  resume_ckpt: checkpoints\ar\epoch_2.pth # 恢复训练使用的 checkpoint
+  resume_ckpt: checkpoints\ar\epoch_12.pth # 恢复训练使用的 checkpoint
   resume: True # 是否默认启用断点恢复
   amp_dtype: fp16 # 训练精度类型(fp16/bf16/fp32)
   cudnn_benchmark: True # 启用 cudnn benchmark 模式以优化卷积性能

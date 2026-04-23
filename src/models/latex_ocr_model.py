@@ -35,7 +35,6 @@ class LatexOCRModel(nn.Module):
         self.vocab_size = int(vocab_size)
         self.pad_id = pad_id
         self.eos_id = eos_id
-        self.ctc_blank_id = int(vocab_size)
         self.use_learned_position_embeddings = use_learned_position_embeddings
         self.max_position_embeddings = max_position_embeddings
         self.use_gradient_checkpointing = bool(use_gradient_checkpointing)
@@ -47,7 +46,7 @@ class LatexOCRModel(nn.Module):
             model_name=vision_model_name,
             pretrained=vision_pretrained,
             d_model=d_model, 
-            ctc_vocab_size=int(vocab_size) + 1,
+            ctc_vocab_size=int(vocab_size),
             in_chans=vision_in_chans,
             drop_path_rate=vision_drop_path_rate,
             use_gradient_checkpointing=self.use_gradient_checkpointing,
@@ -118,7 +117,7 @@ class LatexOCRModel(nn.Module):
         
         Returns:
             当 return_aux=False: (memory, memory_mask)
-            当 return_aux=True: (memory, memory_mask, ctc_logits, sigreg_embedding)
+            当 return_aux=True: (memory, memory_mask, bow_logits, sigreg_embedding)
         """
         return self.encoder(images, return_aux=return_aux)
 
@@ -234,22 +233,22 @@ class LatexOCRModel(nn.Module):
             images: [B, 1, H, W] 图像张量
             tgt_seq: [B, T] 目标序列
             is_causal: 是否使用因果掩码
-            return_aux: 是否返回辅助输出（CTC 和 SIGReg embedding）
+            return_aux: 是否返回辅助输出（BoW 和 SIGReg embedding）
         
         Returns:
             return_aux=False: logits [B, T, vocab_size]
-            return_aux=True: (logits, ctc_logits, sigreg_embedding)
+            return_aux=True: (logits, bow_logits, sigreg_embedding)
         """
         # 1. 获取编码器输出
         encoder_output = self.encoder(images, return_aux=return_aux)
         
         # 2. 根据 return_aux 解包返回值
-        ctc_logits: Optional[torch.Tensor] = None
+        bow_logits: Optional[torch.Tensor] = None
         sigreg_embedding: Optional[torch.Tensor] = None
         
         if return_aux:
-            # return_aux=True 时返回 4 元组: (memory, memory_mask, ctc_logits, sigreg_embedding)
-            memory, memory_mask, ctc_logits, sigreg_embedding = encoder_output
+            # return_aux=True 时返回 4 元组: (memory, memory_mask, bow_logits, sigreg_embedding)
+            memory, memory_mask, bow_logits, sigreg_embedding = encoder_output
         else:
             # return_aux=False 时返回 2 元组: (memory, memory_mask)
             memory, memory_mask = encoder_output
@@ -272,6 +271,6 @@ class LatexOCRModel(nn.Module):
         )
 
         logits = self.head(decoder_out)
-        if return_aux and ctc_logits is not None and sigreg_embedding is not None:
-            return logits, ctc_logits, sigreg_embedding
+        if return_aux and bow_logits is not None and sigreg_embedding is not None:
+            return logits, bow_logits, sigreg_embedding
         return logits

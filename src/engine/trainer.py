@@ -4,6 +4,7 @@ src/engine/trainer.py
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 from tqdm import tqdm
 from typing import Optional
@@ -23,7 +24,8 @@ class ARTrainer:
         channels_last=False,
         label_smoothing=0.0,
         target_ignore_index=-100,
-        ctc_weight=0.5,
+        bow_weight=0.5,
+        ctc_weight: Optional[float] = None,
         ohem_ratio=0.5,
         ema_model=None,
         enable_sigreg: bool = False,
@@ -55,7 +57,10 @@ class ARTrainer:
         self.amp_dtype = amp_dtype
         self.channels_last = bool(channels_last)
         self.label_smoothing = float(label_smoothing)
-        self.ctc_weight = float(ctc_weight)
+        # 兼容旧参数: 若显式传入 ctc_weight，则映射到 bow_weight
+        if ctc_weight is not None:
+            bow_weight = ctc_weight
+        self.bow_weight = float(bow_weight)
         self.ohem_ratio = float(ohem_ratio)
         self.ema_model = ema_model
         
@@ -82,49 +87,6 @@ class ARTrainer:
             label_smoothing=self.label_smoothing,
             reduction="none",
         )
-
-        self.ctc_blank_id = int(getattr(model, "ctc_blank_id", -1))
-        self.ctc_criterion = None
-        if self.ctc_blank_id >= 0:
-            self.ctc_criterion = nn.CTCLoss(blank=self.ctc_blank_id, zero_infinity=True)
-
-    def _compute_ctc_loss(
-        self,
-        ctc_logits: torch.Tensor,
-        image_chunk: torch.Tensor,
-        ar_targets: torch.Tensor,
-        valid_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        if self.ctc_criterion is None:
-            return ctc_logits.new_zeros(())
-
-        time_steps, batch_size, _ = ctc_logits.size()
-        with torch.no_grad():
-            # 基于真实图像有效列估计 CTC 时间长度，减少对右侧纯 padding 区域的冗余 blank 拟合。
-            import torch.nn.functional as F
-
-            downsampled = F.max_pool2d(image_chunk, kernel_size=32, stride=32)
-            valid_cols = (downsampled.squeeze(1) > 1e-5).any(dim=1)
-            input_lengths = valid_cols.sum(dim=1).to(device=ctc_logits.device, dtype=torch.long)
-            input_lengths = input_lengths.clamp(min=1, max=time_steps)
-
-        target_chunks = []
-        target_lengths_list = []
-        for row_idx in range(batch_size):
-            target_row = ar_targets[row_idx][valid_mask[row_idx]]
-            if self.eos_id is not None:
-                target_row = target_row[target_row != int(self.eos_id)]
-            target_chunks.append(target_row)
-            target_lengths_list.append(int(target_row.numel()))
-
-        target_lengths = torch.tensor(target_lengths_list, device=ctc_logits.device, dtype=torch.long)
-        if int(target_lengths.sum().item()) == 0:
-            return ctc_logits.new_zeros(())
-
-        targets = torch.cat([row for row in target_chunks if row.numel() > 0], dim=0).to(dtype=torch.long)
-        # 强制使用 FP32 执行 CTC 的 log_softmax，避免 AMP(fp16) 下数值下溢导致 NaN。
-        log_probs = ctc_logits.float().log_softmax(dim=-1)
-        return self.ctc_criterion(log_probs, targets, input_lengths, target_lengths)
 
     def _optimizer_step(self) -> bool:
         if self.scaler is not None:
@@ -154,7 +116,7 @@ class ARTrainer:
 
                 batch_loss_sum = 0.0
                 batch_ce_sum = 0.0
-                batch_ctc_sum = 0.0
+                batch_bow_sum = 0.0
                 batch_sigreg_sum = 0.0
                 batch_acc_sum = 0.0
 
@@ -167,11 +129,11 @@ class ARTrainer:
                         outputs = self.model(images=img_chunk, tgt_seq=ar_in_chunk, is_causal=True, return_aux=True)
                         if isinstance(outputs, tuple):
                             logits = outputs[0]
-                            ctc_logits = outputs[1] if len(outputs) > 1 else None
+                            bow_logits = outputs[1] if len(outputs) > 1 else None
                             sigreg_embedding = outputs[2] if len(outputs) > 2 else None
                         else:
                             logits = outputs
-                            ctc_logits = None
+                            bow_logits = None
                             sigreg_embedding = None
 
                         vocab_size = logits.size(-1)
@@ -185,22 +147,34 @@ class ARTrainer:
                         top_losses = torch.topk(per_sample_losses, k=keep_count, largest=True).values
                         ce_loss = top_losses.mean()
 
-                        ctc_loss = logits.new_zeros(())
-                        if ctc_logits is not None:
-                            ctc_loss = self._compute_ctc_loss(ctc_logits, img_chunk, ar_tgt_chunk, valid_mask)
+                        bow_loss = logits.new_zeros(())
+                        if bow_logits is not None:
+                            vocab_size = bow_logits.size(-1)
+                            sample_count = bow_logits.size(0)
+                            bow_targets = torch.zeros((sample_count, vocab_size), device=self.device, dtype=bow_logits.dtype)
+
+                            for b_idx in range(sample_count):
+                                seq = ar_tgt_chunk[b_idx]
+                                valid_tokens = seq[seq != self.target_ignore_index]
+                                if self.eos_id is not None:
+                                    valid_tokens = valid_tokens[valid_tokens != int(self.eos_id)]
+                                valid_tokens = valid_tokens[(valid_tokens >= 0) & (valid_tokens < vocab_size)]
+                                if valid_tokens.numel() > 0:
+                                    bow_targets[b_idx].scatter_(0, valid_tokens.long(), 1.0)
+
+                            bow_loss = F.binary_cross_entropy_with_logits(bow_logits, bow_targets)
 
                         # SIGReg-like 损失
                         sigreg_loss = logits.new_zeros(())
                         if self.enable_sigreg and sigreg_embedding is not None and self.sigreg_loss_fn is not None:
                             # 通过池化重建视觉 padding mask (True 表示图片有效区域)
-                            import torch.nn.functional as F
                             with torch.no_grad():
                                 downsampled = F.max_pool2d(img_chunk, kernel_size=32, stride=32)
                                 sigreg_mask = (downsampled.view(img_chunk.size(0), -1) > 1e-5)
                             
                             sigreg_loss = self.sigreg_loss_fn(sigreg_embedding, mask=sigreg_mask)
 
-                        loss = (ce_loss + self.ctc_weight * ctc_loss + self.sigreg_weight * sigreg_loss) / chunks
+                        loss = (ce_loss + self.bow_weight * bow_loss + self.sigreg_weight * sigreg_loss) / chunks
 
                     if self.scaler is not None:
                         self.scaler.scale(loss).backward()
@@ -215,7 +189,7 @@ class ARTrainer:
 
                     batch_loss_sum += loss.item() * chunks
                     batch_ce_sum += ce_loss.item()
-                    batch_ctc_sum += ctc_loss.item()
+                    batch_bow_sum += bow_loss.item()
                     batch_sigreg_sum += sigreg_loss.item() if self.enable_sigreg else 0.0
                     batch_acc_sum += chunk_acc * (img_chunk.size(0) / batch_size)
 
@@ -224,7 +198,7 @@ class ARTrainer:
                     self.scheduler.step()
                 if self.ema_model is not None:
                     self.ema_model.update_parameters(self.model)
-                return batch_loss_sum, batch_ce_sum, batch_ctc_sum, batch_sigreg_sum, batch_acc_sum, True
+                return batch_loss_sum, batch_ce_sum, batch_bow_sum, batch_sigreg_sum, batch_acc_sum, True
 
             except torch.cuda.OutOfMemoryError:
                 try:
@@ -245,13 +219,13 @@ class ARTrainer:
         self.optimizer.zero_grad(set_to_none=True)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        return 0.0, 0.0, 0.0, 0.0, False
+        return 0.0, 0.0, 0.0, 0.0, 0.0, False
 
     def train_epoch(self, dataloader, epoch, log_interval=50):
         self.model.train()
         total_loss = 0.0
         total_ce = 0.0
-        total_ctc = 0.0
+        total_bow = 0.0
         total_sigreg = 0.0
         total_acc = 0.0
         valid_batches = 0
@@ -272,14 +246,14 @@ class ARTrainer:
                 if self.target_ignore_index != self.pad_id:
                     ar_targets = ar_targets.masked_fill(ar_targets == self.pad_id, self.target_ignore_index)
 
-            batch_loss_sum, batch_ce_sum, batch_ctc_sum, batch_sigreg_sum, batch_acc_sum, success = self._train_step_with_retry(images, ar_inputs, ar_targets)
+            batch_loss_sum, batch_ce_sum, batch_bow_sum, batch_sigreg_sum, batch_acc_sum, success = self._train_step_with_retry(images, ar_inputs, ar_targets)
 
             if not success:
                 continue
 
             total_loss += batch_loss_sum
             total_ce += batch_ce_sum
-            total_ctc += batch_ctc_sum
+            total_bow += batch_bow_sum
             total_sigreg += batch_sigreg_sum
             total_acc += batch_acc_sum
             valid_batches += 1
@@ -289,7 +263,7 @@ class ARTrainer:
                     {
                         "Loss": f"{batch_loss_sum:.3f}",
                         "CE": f"{batch_ce_sum:.3f}",
-                        "CTC": f"{batch_ctc_sum:.3f}",
+                        "BoW": f"{batch_bow_sum:.3f}",
                         "SIGReg": f"{batch_sigreg_sum:.3f}" if self.enable_sigreg else "N/A",
                         "Acc": f"{batch_acc_sum*100:.1f}%",
                         "LR": f"{self.scheduler.get_last_lr()[0]:.2e}",
@@ -298,7 +272,7 @@ class ARTrainer:
                 
         avg_loss = total_loss / valid_batches if valid_batches > 0 else 0.0
         avg_ce = total_ce / valid_batches if valid_batches > 0 else 0.0
-        avg_ctc = total_ctc / valid_batches if valid_batches > 0 else 0.0
+        avg_bow = total_bow / valid_batches if valid_batches > 0 else 0.0
         avg_sigreg = total_sigreg / valid_batches if valid_batches > 0 else 0.0
         avg_acc = total_acc / valid_batches if valid_batches > 0 else 0.0
-        return avg_loss, avg_ce, avg_ctc, avg_sigreg, avg_acc
+        return avg_loss, avg_ce, avg_bow, avg_sigreg, avg_acc

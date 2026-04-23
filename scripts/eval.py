@@ -807,6 +807,7 @@ def build_model(
 	return model
 
 
+@torch.no_grad()
 def evaluate(args: argparse.Namespace) -> Tuple[float, float, int]:
 	resolve_eval_runtime_args(args)
 	device = torch.device(args.device)
