@@ -155,7 +155,7 @@ class ARTrainer:
 
                             for b_idx in range(sample_count):
                                 seq = ar_tgt_chunk[b_idx]
-                                valid_tokens = seq[seq != self.target_ignore_index]
+                                valid_tokens = seq[(seq != self.target_ignore_index) & (seq != self.pad_id)]
                                 if self.eos_id is not None:
                                     valid_tokens = valid_tokens[valid_tokens != int(self.eos_id)]
                                 valid_tokens = valid_tokens[(valid_tokens >= 0) & (valid_tokens < vocab_size)]
