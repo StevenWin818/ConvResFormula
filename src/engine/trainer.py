@@ -32,6 +32,7 @@ class ARTrainer:
         sigreg_weight: float = 0.1,
         sigreg_num_projections: int = 1024,
         sigreg_collapse_threshold: float = 0.01,
+        decoder_input_noise_ratio: float = 0.08,
     ):
         """
         Args:
@@ -47,6 +48,7 @@ class ARTrainer:
             sigreg_weight: SIGReg 损失权重
             sigreg_num_projections: SIGReg 随机投影次数
             sigreg_collapse_threshold: embedding 坍塌检测阈值
+            decoder_input_noise_ratio: 解码器输入随机 Token 替换概率
         """
         self.model = model
         self.optimizer = optimizer
@@ -74,6 +76,12 @@ class ARTrainer:
                 collapse_threshold=float(sigreg_collapse_threshold),
                 seed=None,
             ).to(device)
+        
+        # 解码器输入噪声参数
+        self.decoder_input_noise_ratio = float(decoder_input_noise_ratio)
+        if not (0.0 <= self.decoder_input_noise_ratio <= 1.0):
+            raise ValueError(f"decoder_input_noise_ratio 必须在 [0,1] 区间，当前为 {self.decoder_input_noise_ratio}")
+        
         if not (0.0 <= self.label_smoothing < 1.0):
             raise ValueError(f"label_smoothing 必须在 [0,1) 区间，当前为 {self.label_smoothing}")
         if not (0.0 < self.ohem_ratio <= 1.0):
@@ -125,8 +133,33 @@ class ARTrainer:
                     ar_in_chunk = ar_inputs[i : i + chunk_size]
                     ar_tgt_chunk = ar_targets[i : i + chunk_size]
 
+                    # ==========================================
+                    # 注入 Decoder Input Noise (缓解曝光偏差)
+                    # ==========================================
+                    noise_ratio = self.decoder_input_noise_ratio
+
+                    if noise_ratio > 0.0:
+                        # 生成与 ar_in_chunk 同形状的随机概率矩阵
+                        prob_mask = torch.rand_like(ar_in_chunk, dtype=torch.float) < noise_ratio
+
+                        # 保护关键 Token：绝对不能对 padding 注入噪声
+                        valid_mask = (ar_in_chunk != self.pad_id) & (ar_in_chunk != self.target_ignore_index)
+
+                        # 只有在有效区域，且命中概率的，才进行替换
+                        apply_mask = prob_mask & valid_mask
+
+                        # 生成全局随机 Token (范围在 0 到 vocab_size-1 之间)
+                        vocab_size = int(getattr(self.model, "vocab_size", int(ar_in_chunk.max().item()) + 1))
+                        random_tokens = torch.randint_like(ar_in_chunk, low=0, high=vocab_size)
+
+                        # 应用噪声：命中 apply_mask 的位置替换为随机 Token
+                        ar_in_chunk_noisy = torch.where(apply_mask, random_tokens, ar_in_chunk)
+                    else:
+                        ar_in_chunk_noisy = ar_in_chunk
+                    # ==========================================
+
                     with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.amp_enabled):
-                        outputs = self.model(images=img_chunk, tgt_seq=ar_in_chunk, is_causal=True, return_aux=True)
+                        outputs = self.model(images=img_chunk, tgt_seq=ar_in_chunk_noisy, is_causal=True, return_aux=True)
                         if isinstance(outputs, tuple):
                             logits = outputs[0]
                             bow_logits = outputs[1] if len(outputs) > 1 else None

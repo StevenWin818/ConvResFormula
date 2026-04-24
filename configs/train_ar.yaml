@@ -11,23 +11,24 @@ data:
 training:
   batch_size: 32 # 训练 batch 大小
   num_workers: 4 # 训练 DataLoader 线程数
-  epochs: 18 # 总训练轮数
+  epochs: 30 # 总训练轮数
   seed: 42 # 随机种子
   mix_ratio: [0, 0, 0,1] # 多数据源采样比例，真实手写:合成手写:单字符手写:wiki
   epoch_samples: 318400 # 每个 epoch 的采样总数，<=0 表示全量
   bucket_mega_factor: 64 # 分桶 mega-batch 系数
+  decoder_input_noise_ratio: 0.08 # 解码器输入随机 Token 替换概率（缓解曝光偏差）
 
 optimization:
-  encoder_lr: 7.0e-5 # 编码器学习率
-  decoder_lr: 1.0e-4 # 解码器学习率
+  encoder_lr: 6e-5 # 编码器学习率
+  decoder_lr: 1.0e-5 # 解码器学习率
   weight_decay: 1.0e-2 # AdamW 权重衰减
   label_smoothing: 0.1 # 交叉熵标签平滑，提升泛化能力
   bow_weight: 1.0 # BoW 辅助损失权重
-  ohem_ratio: 1.0 # OHEM 困难样本保留比例，设为 1.0 即不使用 OHEM
+  ohem_ratio: 0.5 # OHEM 困难样本保留比例，设为 1.0 即不使用 OHEM
   enable_sigreg: true # 是否启用 SIGReg-like 正则化
-  sigreg_weight: 0.01 # SIGReg-like 损失权重
+  sigreg_weight: 0.08 # SIGReg-like 损失权重
   sigreg_num_projections: 1024 # SIGReg 随机投影次数
-  sigreg_collapse_threshold: 0.01 # SIGReg embedding 坍塌检测阈值
+  sigreg_collapse_threshold: 0.03 # SIGReg embedding 坍塌检测阈值
 
 augmentation:
   enable: true
@@ -78,7 +79,7 @@ eval:
 runtime:
   ckpt_dir: checkpoints/ar # checkpoint 输出目录
   log_dir: logs/ar_logs # 日志输出目录
-  resume_ckpt: checkpoints\ar\epoch_12.pth # 恢复训练使用的 checkpoint
+  resume_ckpt: checkpoints\ar\epoch_24.pth # 恢复训练使用的 checkpoint
   resume: True # 是否默认启用断点恢复
   amp_dtype: fp16 # 训练精度类型(fp16/bf16/fp32)
   cudnn_benchmark: True # 启用 cudnn benchmark 模式以优化卷积性能

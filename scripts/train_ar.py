@@ -99,6 +99,7 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--sigreg_weight", type=float, default=None, help="SIGReg-like 损失权重")
 	parser.add_argument("--sigreg_num_projections", type=int, default=None, help="SIGReg 随机投影次数")
 	parser.add_argument("--sigreg_collapse_threshold", type=float, default=None, help="SIGReg embedding 坍塌检测阈值")
+	parser.add_argument("--decoder_input_noise_ratio", type=float, default=None, help="解码器输入随机 Token 替换概率（缓解曝光偏差）")
 
 	parser.add_argument("--warmup_epochs", type=float, default=None, help=h("warmup_epochs", "学习率 warmup 轮数"))
 	parser.add_argument("--warmup_start_lr", type=float, default=None, help=h("warmup_start_lr", "warmup 起始学习率"))
@@ -237,6 +238,8 @@ def apply_config_defaults(args: argparse.Namespace, train_cfg: Dict[str, Any], m
 	args.sigreg_weight = args.sigreg_weight if args.sigreg_weight is not None else float(_cfg_get(train_cfg, ("optimization", "sigreg_weight"), 0.1))
 	args.sigreg_num_projections = args.sigreg_num_projections if args.sigreg_num_projections is not None else int(_cfg_get(train_cfg, ("optimization", "sigreg_num_projections"), 1024))
 	args.sigreg_collapse_threshold = args.sigreg_collapse_threshold if args.sigreg_collapse_threshold is not None else float(_cfg_get(train_cfg, ("optimization", "sigreg_collapse_threshold"), 0.01))
+
+	args.decoder_input_noise_ratio = args.decoder_input_noise_ratio if args.decoder_input_noise_ratio is not None else float(_cfg_get(train_cfg, ("training", "decoder_input_noise_ratio"), 0.08))
 
 	args.warmup_epochs = args.warmup_epochs if args.warmup_epochs is not None else float(_cfg_get(train_cfg, ("scheduler", "warmup_epochs"), 1.0))
 	args.warmup_start_lr = args.warmup_start_lr if args.warmup_start_lr is not None else float(_cfg_get(train_cfg, ("scheduler", "warmup_start_lr"), 1e-7))
@@ -1212,6 +1215,7 @@ def main() -> None:
 		sigreg_weight=float(args.sigreg_weight),
 		sigreg_num_projections=int(args.sigreg_num_projections),
 		sigreg_collapse_threshold=float(args.sigreg_collapse_threshold),
+		decoder_input_noise_ratio=float(args.decoder_input_noise_ratio),
 	)
 
 	if not os.path.exists(log_path):
