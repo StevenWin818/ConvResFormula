@@ -178,7 +178,8 @@ class AttnResDecoderLayer(nn.Module):
         cross_features: torch.Tensor,
         memory_key_padding_mask: Optional[torch.Tensor] = None,
         precomputed_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> torch.Tensor:
+        return_attn_weights: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         batch_size, query_len, _ = x.shape
         q = _split_heads(self.cross_q(x), self.nhead)
 
@@ -194,16 +195,25 @@ class AttnResDecoderLayer(nn.Module):
             total_mask = _additive_mask_from_padding(memory_key_padding_mask, query_len, key_len, q.dtype)
 
         dropout_p = self.dropout_p if self.training else 0.0
-        out = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=total_mask,
-            dropout_p=dropout_p,
-        )
+        
+        if return_attn_weights:
+            attn_weight = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(q.size(-1))
+            if total_mask is not None:
+                attn_weight += total_mask
+            attn_weight = F.softmax(attn_weight, dim=-1)
+            out = torch.matmul(attn_weight, v)
+        else:
+            out = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=total_mask,
+                dropout_p=dropout_p,
+            )
+            attn_weight = None
 
         out = _merge_heads(out)
-        return self.cross_out(out)
+        return self.cross_out(out), attn_weight
 
     def precompute_cross_kv(self, cross_features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """预计算当前层的 cross-attention K/V。"""
@@ -220,6 +230,7 @@ class AttnResDecoderLayer(nn.Module):
         memory_key_padding_mask=None,
         precomputed_cross_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         past_self_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        return_attn_weights: bool = False,
     ):
         # 1. Pre-Norm Self Attention
         residual = tgt
@@ -236,14 +247,16 @@ class AttnResDecoderLayer(nn.Module):
         tgt = residual + self.dropout1(tgt2)
 
         # 2. Pre-Norm Cross Attention
+        attn_weights = None
         if cross_features is not None:
             residual = tgt
             tgt2 = self.norm2(tgt)
-            tgt2 = self._cross_attention(
+            tgt2, attn_weights = self._cross_attention(
                 tgt2,
                 cross_features,
                 memory_key_padding_mask=memory_key_padding_mask,
                 precomputed_kv=precomputed_cross_kv,
+                return_attn_weights=return_attn_weights,
             )
             tgt = residual + self.dropout2(tgt2)
 
@@ -253,7 +266,7 @@ class AttnResDecoderLayer(nn.Module):
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt2))))
         tgt = residual + self.dropout3(tgt2)
 
-        return tgt, (new_k, new_v)
+        return tgt, (new_k, new_v), attn_weights
 
 
 class AttnResTextDecoder(nn.Module):
@@ -295,6 +308,7 @@ class AttnResTextDecoder(nn.Module):
         tgt_key_padding_mask=None,
         memory_key_padding_mask=None,
         precomputed_cross_kvs: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        return_attn_weights: bool = False,
     ):
         """训练时的全序列前向。"""
         x = text_embeddings
@@ -302,9 +316,10 @@ class AttnResTextDecoder(nn.Module):
         if cross_features is not None and precomputed_cross_kvs is None:
             precomputed_cross_kvs = self._precompute_cross_kv(cross_features)
 
+        all_attn_weights = []
         for idx, layer in enumerate(self.layers):
             cross_kv = None if precomputed_cross_kvs is None else precomputed_cross_kvs[idx]
-            x, _ = layer(
+            x, _, attn_w = layer(
                 x,
                 cross_features,
                 tgt_mask=tgt_mask,
@@ -312,8 +327,13 @@ class AttnResTextDecoder(nn.Module):
                 memory_key_padding_mask=memory_key_padding_mask,
                 precomputed_cross_kv=cross_kv,
                 past_self_kv=None,
+                return_attn_weights=return_attn_weights,
             )
+            if attn_w is not None:
+                all_attn_weights.append(attn_w)
 
+        if return_attn_weights:
+            return self.norm(x), all_attn_weights
         return self.norm(x)
 
     def forward_step(
@@ -323,7 +343,8 @@ class AttnResTextDecoder(nn.Module):
         past_key_values: Optional[List[Optional[Tuple[torch.Tensor, torch.Tensor]]]],
         memory_key_padding_mask: Optional[torch.Tensor] = None,
         precomputed_cross_kvs: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
-    ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]]]:
+        return_attn_weights: bool = False,
+    ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]], Optional[List[torch.Tensor]]]:
         """单步自回归前向，配合 KV Cache 使用。"""
         x = text_embeddings
 
@@ -331,9 +352,10 @@ class AttnResTextDecoder(nn.Module):
             precomputed_cross_kvs = self._precompute_cross_kv(cross_features)
 
         new_key_values: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        all_attn_weights = []
         for idx, layer in enumerate(self.layers):
             past_self_kv = None if past_key_values is None else past_key_values[idx]
-            x, new_self_kv = layer(
+            x, new_self_kv, attn_w = layer(
                 x,
                 cross_features,
                 tgt_mask=None,
@@ -341,10 +363,13 @@ class AttnResTextDecoder(nn.Module):
                 memory_key_padding_mask=memory_key_padding_mask,
                 precomputed_cross_kv=precomputed_cross_kvs[idx],
                 past_self_kv=past_self_kv,
+                return_attn_weights=return_attn_weights,
             )
             new_key_values.append(new_self_kv)
+            if attn_w is not None:
+                all_attn_weights.append(attn_w)
 
-        return self.norm(x), new_key_values
+        return self.norm(x), new_key_values, all_attn_weights if return_attn_weights else None
 
     def forward_step_cached(
         self,
@@ -352,16 +377,18 @@ class AttnResTextDecoder(nn.Module):
         cross_features: torch.Tensor,
         cache: AttnResDecodeCache,
         memory_key_padding_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, AttnResDecodeCache]:
+        return_attn_weights: bool = False,
+    ) -> Tuple[torch.Tensor, AttnResDecodeCache, Optional[List[torch.Tensor]]]:
         """单步自回归前向，显式使用 AttnResDecodeCache。"""
-        decoder_out, new_self_key_values = self.forward_step(
+        decoder_out, new_self_key_values, attn_weights = self.forward_step(
             text_embeddings=text_embeddings,
             cross_features=cross_features,
             past_key_values=cache.self_key_values,
             memory_key_padding_mask=memory_key_padding_mask,
             precomputed_cross_kvs=cache.cross_kvs,
+            return_attn_weights=return_attn_weights,
         )
         return decoder_out, AttnResDecodeCache(
             self_key_values=cast(List[Optional[Tuple[torch.Tensor, torch.Tensor]]], new_self_key_values),
             cross_kvs=cache.cross_kvs,
-        )
+        ), attn_weights

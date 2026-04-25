@@ -149,11 +149,11 @@ class ARTrainer:
                         apply_mask = prob_mask & valid_mask
 
                         # 生成全局随机 Token (范围在 0 到 vocab_size-1 之间)
-                        vocab_size = int(getattr(self.model, "vocab_size", int(ar_in_chunk.max().item()) + 1))
-                        random_tokens = torch.randint_like(ar_in_chunk, low=0, high=vocab_size)
+                        # vocab_size = int(getattr(self.model, "vocab_size", int(ar_in_chunk.max().item()) + 1))
+                        # random_tokens = torch.randint_like(ar_in_chunk, low=0, high=vocab_size)
 
-                        # 应用噪声：命中 apply_mask 的位置替换为随机 Token
-                        ar_in_chunk_noisy = torch.where(apply_mask, random_tokens, ar_in_chunk)
+                        # 应用噪声：命中 apply_mask 的位置替换为遮盖 Token
+                        ar_in_chunk_noisy = torch.where(apply_mask, self.pad_id, ar_in_chunk)
                     else:
                         ar_in_chunk_noisy = ar_in_chunk
                     # ==========================================
@@ -211,8 +211,19 @@ class ARTrainer:
 
                     if self.scaler is not None:
                         self.scaler.scale(loss).backward()
+                        
+                        # 记录 unscale 之前的梯度范数探针
+                        self.scaler.unscale_(self.optimizer)
                     else:
                         loss.backward()
+
+                    # Gradient probe
+                    try:
+                        enc_norm = torch.nn.utils.clip_grad_norm_(self.model.encoder.parameters(), max_norm=float('inf')).item()
+                        dec_norm = torch.nn.utils.clip_grad_norm_(self.model.decoder.parameters(), max_norm=float('inf')).item()
+                        # tqdm.write(f"Grad Norm Probes -> Enc: {enc_norm:.3f}, Dec: {dec_norm:.3f}, Ratio(Dec/Enc): {(dec_norm/enc_norm if enc_norm > 0 else 0):.3f}")
+                    except Exception:
+                        pass
 
                     preds = logits.argmax(dim=-1)
                     if valid_mask.any():

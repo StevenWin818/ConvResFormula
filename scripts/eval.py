@@ -598,7 +598,7 @@ def check_visual_equivalence(gt_tex: str, pred_tex: str, svg_renderer: NodeKatex
 	return compare_svg_dom_and_paths(svg_gt, svg_pred)
 
 def parse_args() -> argparse.Namespace:
-	parser = argparse.ArgumentParser(description="AR 贪心解码评估脚本（SVG DOM 严格一致性）")
+	parser = argparse.ArgumentParser(description="AR 解码评估脚本（SVG DOM 严格一致性）")
 	parser.add_argument("--eval_h5", type=str, default=r"C:\Projects\LatexProject\ConvResFormula\datasets\val.h5")
 	parser.add_argument("--tokenizer", type=str, default=r"C:\Projects\LatexProject\ConvResFormula\tokenizer_bpe.json")
 	parser.add_argument("--checkpoint", type=str, default=r"checkpoints\ar\best.pth")
@@ -607,6 +607,7 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--d_model", type=int, default=256)
 	parser.add_argument("--max_area", type=int, default=98304)
 	parser.add_argument("--batch_size", type=int, default=32)
+	parser.add_argument("--beam_size", type=int, default=1, help="Beam Search 大小，默认 1 为贪心解码")
 	parser.add_argument("--num_workers", type=int, default=4)
 	parser.add_argument("--max_len", type=int, default=160)
 	parser.add_argument("--max_samples", type=int, default=0, help="评估样本数上限，<=0 表示全量")
@@ -723,19 +724,67 @@ def batched_infer_ar(
 	max_len: int,
 	amp_enabled: bool,
 	amp_dtype: torch.dtype,
+	beam_size: int = 1,
 ) -> List[List[int]]:
-	"""批量版 AR 贪心解码。"""
+	"""批量版 AR 解码，支持贪心与束搜索 (Beam Search)。"""
 	batch_size = images.size(0)
 	device = images.device
 
 	with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
 		memory, memory_padding_mask = model.encode(images)
+		
+	if beam_size <= 1:
+		# 贪心解码
 		decode_cache = model.init_decode_cache(memory)
+		generated = torch.full((batch_size, max_len), pad_id, dtype=torch.long, device=device)
+		generated[:, 0] = bos_id
+		finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+		
+		for step in range(1, max_len):
+			with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+				current_token = generated[:, step - 1]
+				logits, decode_cache = model.decode_step_cached(
+					memory=memory,
+					token_id=current_token,
+					cache=decode_cache,
+					memory_padding_mask=memory_padding_mask,
+				)
 
-	generated = torch.full((batch_size, max_len), pad_id, dtype=torch.long, device=device)
+			next_tokens = logits.argmax(dim=-1)
+			next_tokens = next_tokens.masked_fill(finished, pad_id)
+
+			generated[:, step] = next_tokens
+			finished |= (next_tokens == eos_id)
+			if finished.all():
+				break
+
+		output_batch: List[List[int]] = []
+		for row in generated.cpu().tolist():
+			if eos_id in row:
+				row = row[: row.index(eos_id)]
+			output_batch.append(row)
+
+		return output_batch
+
+	# Batched Beam Search
+	vocab_size = model.vocab_size
+
+	# 张量膨胀：在 Batch 维度上并行展开 Beam
+	memory = memory.repeat_interleave(beam_size, dim=0)
+	if memory_padding_mask is not None:
+		memory_padding_mask = memory_padding_mask.repeat_interleave(beam_size, dim=0)
+	
+	decode_cache = model.init_decode_cache(memory)
+
+	generated = torch.full((batch_size * beam_size, max_len), pad_id, dtype=torch.long, device=device)
 	generated[:, 0] = bos_id
-	finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
-	# 循环从步数 1 开始，直到 max_len
+	
+	beam_scores = torch.full((batch_size, beam_size), -1e9, dtype=torch.float, device=device)
+	beam_scores[:, 0] = 0.0
+	beam_scores = beam_scores.view(-1)
+	
+	finished = torch.zeros(batch_size * beam_size, dtype=torch.bool, device=device)
+
 	for step in range(1, max_len):
 		with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
 			current_token = generated[:, step - 1]
@@ -746,23 +795,75 @@ def batched_infer_ar(
 				memory_padding_mask=memory_padding_mask,
 			)
 
-		next_tokens = logits.argmax(dim=-1)
-		next_tokens = next_tokens.masked_fill(finished, pad_id)
+		log_probs = torch.log_softmax(logits, dim=-1)
 
-		# 直接原地切片赋值，避免逐步拼接带来的额外开销。
-		generated[:, step] = next_tokens
+		# 对于已完成的序列，强制其继续生成 pad_id 且得分为 0 (不改变总得分)
+		log_probs[finished, :] = -1e9
+		log_probs[finished, pad_id] = 0.0
 
-		finished |= (next_tokens == eos_id)
+		next_scores = beam_scores.unsqueeze(1) + log_probs
+		next_scores = next_scores.view(batch_size, beam_size * vocab_size)		
+
+		topk_scores, topk_indices = torch.topk(next_scores, beam_size, dim=1)
+		
+		beam_indices = topk_indices // vocab_size
+		next_tokens = topk_indices % vocab_size
+		
+		beam_scores = topk_scores.view(-1)
+		
+		# 将相对索引转换为绝对索引
+		batch_offset = torch.arange(batch_size, device=device).unsqueeze(1) * beam_size
+		absolute_beam_indices = (beam_indices + batch_offset).view(-1)
+		
+		# 更新序列和完成状态
+		generated = generated[absolute_beam_indices]
+		generated[:, step] = next_tokens.view(-1)
+		
+		finished = finished[absolute_beam_indices]
+		finished |= (next_tokens.view(-1) == eos_id)
+		
+		# 更新 KV Cache
+		if decode_cache.self_key_values is not None:
+			new_self_kv = []
+			for layer_kv in decode_cache.self_key_values:
+				if layer_kv is None:
+					new_self_kv.append(None)
+				else:
+					k, v = layer_kv
+					new_self_kv.append((k[absolute_beam_indices], v[absolute_beam_indices]))
+			decode_cache.self_key_values = new_self_kv
+
 		if finished.all():
 			break
 
-	output_batch: List[List[int]] = []
-	for row in generated.cpu().tolist():
+	# 将拉平的张量重新变回 [batch_size, beam_size, max_len]
+	generated = generated.view(batch_size, beam_size, max_len)
+	beam_scores = beam_scores.view(batch_size, beam_size)
+
+	# 1. 计算真实的有效长度 
+	lengths = (generated != pad_id).sum(dim=2).float()
+
+	# 2. 在终点线进行全局长度惩罚
+	alpha = 0.8
+	# 注意：因为分数是负数，除以一个大于 1 的长度因子，反而会让长句子的负分变小
+	# 但 PyTorch 中的 Log-Prob 通常直接除以长度。如果你发现模型过于偏向超长乱码，可以调整 alpha 为 0.6 甚至 0.5
+	penalized_scores = beam_scores / (lengths ** alpha)
+
+	# 3. 找出惩罚后，性价比最高的那一条束 (Beam)
+	best_indices = penalized_scores.argmax(dim=1)  # [batch_size]
+
+	# 4. 根据最优索引提取最终结果
+	batch_indices = torch.arange(batch_size, device=device)
+	best_generated = generated[batch_indices, best_indices, :]
+	
+	# 转换为 Python List 并截断 EOS
+	output_batch_beam: List[List[int]] = []
+	for row in best_generated.cpu().tolist():
 		if eos_id in row:
 			row = row[: row.index(eos_id)]
-		output_batch.append(row)
+		output_batch_beam.append(row)
 
-	return output_batch
+	return output_batch_beam
 
 
 def build_model(
@@ -908,6 +1009,7 @@ def evaluate(args: argparse.Namespace) -> Tuple[float, float, int]:
 				max_len=args.max_len,
 				amp_enabled=amp_enabled,
 				amp_dtype=eval_amp_dtype,
+				beam_size=args.beam_size,
 			)
 
 			for i in range(len(pred_batch)):
