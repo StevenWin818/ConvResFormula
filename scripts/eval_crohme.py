@@ -271,7 +271,7 @@ def batched_infer_ar(
     beam_scores = beam_scores.view(batch_size, beam_size)
 
     lengths = (generated != pad_id).sum(dim=2).float()
-    alpha = 0.8
+    alpha = 1.4
     penalized_scores = beam_scores / (lengths ** alpha)
 
     best_beam_indices = penalized_scores.argmax(dim=1)
