@@ -56,54 +56,66 @@ def clean_latex_for_encoding(latex_str):
 # 核心视觉算子定义
 # ==========================================
 
-def get_optimal_scale(h5_path: str, target_pixel_height: int = 96, sample_limit: int = 50000) -> float:
-    """提取最优全局渲染缩放比"""
-    heights = []
-    with h5py.File(h5_path, 'r') as f:
-        pt_off = np.asarray(f["sample_point_offsets"])
-        d_points: Any = f["points"]
-        total = len(pt_off) - 1
-        limit = min(total, sample_limit)
-        
-        np.random.seed(42)
-        indices = np.random.choice(total, limit, replace=False)
-        
-        for idx in indices:
-            p0, p1 = int(pt_off[idx]), int(pt_off[idx + 1])
-            if p1 > p0:
-                points = np.asarray(d_points[p0:p1], dtype=np.float32)
-                if len(points) > 0:
-                    h = float(np.max(points[:, 1]) - np.min(points[:, 1]))
-                    if h > 1e-5: heights.append(h)
-                    
-    if not heights: return 1.0
-    p95 = np.percentile(heights, 95)
-    return float(target_pixel_height / p95)
-
-def render_with_fixed_scale(strokes: list, fixed_scale: float, padding: int = 4) -> np.ndarray | None:
+def render_adaptive_stroke_scale(strokes: list, target_stroke_diag: float = 80.0, base_thickness: int = 4, padding: int = 16) -> np.ndarray | None:
+    """
+    单样本自适应高清渲染器：根据每个公式自身的笔画大小进行动态缩放，
+    确保所有图像输出都是高分辨率且线宽比例一致的，杜绝模糊与粘连。
+    """
     valid_strokes = [s for s in strokes if s is not None and len(s) > 0]
     if not valid_strokes: return None
 
-    all_points = np.vstack(valid_strokes)
+    # 1. 计算当前样本的固有尺度 (使用笔画对角线的 75 分位数，过滤掉小数点等噪点)
+    diags = []
+    for stroke in valid_strokes:
+        min_x, min_y = np.min(stroke, axis=0)
+        max_x, max_y = np.max(stroke, axis=0)
+        diag = math.hypot(max_x - min_x, max_y - min_y)
+        if diag > 1e-3:
+            diags.append(diag)
+            
+    if not diags:
+        scale = 1.0 
+    else:
+        p75_diag = np.percentile(diags, 75)
+        # 将当前公式的特征字号缩放到目标高清尺寸 (如 80 像素)
+        scale = target_stroke_diag / max(p75_diag, 1e-3)
+        
+    # 防止极端的脏数据导致内存溢出
+    scale = min(scale, 1000.0) 
+
+    # 2. 应用自适应缩放并计算画布边界
+    all_points = np.vstack(valid_strokes) * scale
     min_x, min_y = np.min(all_points, axis=0)
     max_x, max_y = np.max(all_points, axis=0)
 
-    width = float(max_x - min_x)
-    height = float(max_y - min_y)
+    width = max_x - min_x
+    height = max_y - min_y
 
-    target_height = max(int(round(height * fixed_scale)) + 2 * padding, 2 * padding + 1)
-    target_width = max(int(round(width * fixed_scale)) + 2 * padding, 2 * padding + 1)
+    target_height = int(math.ceil(height)) + 2 * padding
+    target_width = int(math.ceil(width)) + 2 * padding
     
+    # 安全锁：如果渲染尺寸超过 8000x8000，强行限制（防 OOM）
+    if target_height > 8000 or target_width > 8000:
+        safe_scale = 8000.0 / max(target_height, target_width)
+        scale *= safe_scale
+        all_points = np.vstack(valid_strokes) * scale
+        min_x, min_y = np.min(all_points, axis=0)
+        target_height = int(math.ceil(np.max(all_points[:, 1]) - min_y)) + 2 * padding
+        target_width = int(math.ceil(np.max(all_points[:, 0]) - min_x)) + 2 * padding
+
+    # 3. 执行高清绘制
     canvas = np.zeros((target_height, target_width), dtype=np.uint8)
 
     for stroke in valid_strokes:
         scaled = np.zeros_like(stroke, dtype=np.int32)
-        scaled[:, 0] = ((stroke[:, 0] - min_x) * fixed_scale).astype(np.int32) + padding
-        scaled[:, 1] = ((stroke[:, 1] - min_y) * fixed_scale).astype(np.int32) + padding
+        scaled[:, 0] = (stroke[:, 0] * scale - min_x).astype(np.int32) + padding
+        scaled[:, 1] = (stroke[:, 1] * scale - min_y).astype(np.int32) + padding
+        
         if len(scaled) == 1:
-            cv2.circle(canvas, tuple(scaled[0]), radius=1, color=255, thickness=-1)
+            cv2.circle(canvas, tuple(scaled[0]), radius=base_thickness//2, color=255, thickness=-1)
         else:
-            cv2.polylines(canvas, [scaled.reshape((-1, 1, 2))], isClosed=False, color=255, thickness=2, lineType=cv2.LINE_AA)
+            cv2.polylines(canvas, [scaled.reshape((-1, 1, 2))], isClosed=False, color=255, thickness=base_thickness, lineType=cv2.LINE_AA)
+            
     return canvas
 
 def pad_to_stride(image: np.ndarray, stride: int = 32, min_size: int = 32) -> np.ndarray:
@@ -121,7 +133,7 @@ def pad_to_stride(image: np.ndarray, stride: int = 32, min_size: int = 32) -> np
 # 主流处理管道
 # ==========================================
 
-def build_dataset(name: str, source_h5: str, target_h5: str, tokenizer: Tokenizer, target_h: int = 96):
+def build_dataset(name: str, source_h5: str, target_h5: str, tokenizer: Tokenizer, target_h: int = 12):
     print(f"\n" + "="*50)
     print(f"· 开始构建数据集: {name}")
     print(f"· 来源: {source_h5}")
@@ -129,9 +141,6 @@ def build_dataset(name: str, source_h5: str, target_h5: str, tokenizer: Tokenize
     if not os.path.exists(source_h5):
         print(f"❌ 找不到源文件 {source_h5}，跳过。")
         return
-
-    scale = get_optimal_scale(source_h5, target_pixel_height=target_h)
-    print(f"✅ 自动采用全局缩放比: {scale:.4f} (基准高度: {target_h})")
 
     os.makedirs(os.path.dirname(target_h5), exist_ok=True)
     csv_path = target_h5.replace(".h5", "_metadata.csv")
@@ -188,7 +197,7 @@ def build_dataset(name: str, source_h5: str, target_h5: str, tokenizer: Tokenize
                 if l > 0: strokes.append(points[cursor:cursor+l])
                 cursor += l
                 
-            img = render_with_fixed_scale(strokes, fixed_scale=scale)
+            img = render_adaptive_stroke_scale(strokes, target_stroke_diag=80.0, base_thickness=4)
             if img is None: continue
             
             # 步长严格对齐 32
@@ -231,25 +240,25 @@ if __name__ == "__main__":
     print(f"· 正在加载 BPE Tokenizer: {TOKENIZER_PATH}")
     tokenizer = Tokenizer.from_file(TOKENIZER_PATH)
 
-    DEFAULT_TARGET_H = 96
+    DEFAULT_TARGET_H = 128
 
     # === 2. 配置数据集  ===
     DATASETS_TO_BUILD = [
-        ("手写训练集 (Train)", 
-         r"C:\Projects\LatexProject\datasets\train.h5", 
-         r"C:\Projects\LatexProject\ConvResFormula\datasets\train96.h5", DEFAULT_TARGET_H),
+        # ("手写训练集 (Train)", 
+        #  r"C:\Projects\LatexProject\datasets\train.h5", 
+        #  r"C:\Projects\LatexProject\ConvResFormula\datasets\train.h5", DEFAULT_TARGET_H),
          
         ("手写验证集 (Val)", 
          r"C:\Projects\LatexProject\datasets\val.h5", 
-         r"C:\Projects\LatexProject\ConvResFormula\datasets\val96.h5", DEFAULT_TARGET_H),
+         r"C:\Projects\LatexProject\ConvResFormula\datasets\val_1.h5", DEFAULT_TARGET_H),
          
-        ("合成长公式 (Synthetic)", 
-         r"C:\Projects\LatexProject\datasets\synthetic.h5", 
-         r"C:\Projects\LatexProject\ConvResFormula\datasets\synthetic96.h5", DEFAULT_TARGET_H),
+        # ("合成长公式 (Synthetic)", 
+        #  r"C:\Projects\LatexProject\datasets\synthetic.h5", 
+        #  r"C:\Projects\LatexProject\ConvResFormula\datasets\synthetic.h5", DEFAULT_TARGET_H),
          
-        ("单字符集 (Symbols)", 
-         r"C:\Projects\LatexProject\datasets\symbols.h5", 
-         r"C:\Projects\LatexProject\ConvResFormula\datasets\symbols96.h5", DEFAULT_TARGET_H),
+        # ("单字符集 (Symbols)", 
+        #  r"C:\Projects\LatexProject\datasets\symbols.h5", 
+        #  r"C:\Projects\LatexProject\ConvResFormula\datasets\symbols.h5", DEFAULT_TARGET_H),
     ]
 
     for name, src, dst, target_h in DATASETS_TO_BUILD:

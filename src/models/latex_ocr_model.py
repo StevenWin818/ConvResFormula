@@ -161,6 +161,7 @@ class LatexOCRModel(nn.Module):
         past_key_values=None,
         memory_padding_mask: Optional[torch.Tensor] = None,
         precomputed_cross_kvs=None,
+        return_attn_weights: bool = False,
     ):
         """单步自回归解码，配合 KV Cache 使用。"""
         if token_id.dim() == 1:
@@ -179,14 +180,17 @@ class LatexOCRModel(nn.Module):
         if precomputed_cross_kvs is None:
             precomputed_cross_kvs = self.precompute_cross_kv(memory)
 
-        decoder_out, new_key_values = self.decoder.forward_step(
+        decoder_out, new_key_values, attn_weights = self.decoder.forward_step(
             text_embeddings=tgt_emb,
             cross_features=memory,
             past_key_values=past_key_values,
             memory_key_padding_mask=memory_padding_mask,
             precomputed_cross_kvs=precomputed_cross_kvs,
+            return_attn_weights=return_attn_weights,
         )
         logits = self.head(decoder_out.squeeze(1))
+        if return_attn_weights:
+            return logits, new_key_values, attn_weights
         return logits, new_key_values
 
     def decode_step_cached(
@@ -195,6 +199,7 @@ class LatexOCRModel(nn.Module):
         token_id: torch.Tensor,
         cache: AttnResDecodeCache,
         memory_padding_mask: Optional[torch.Tensor] = None,
+        return_attn_weights: bool = False,
     ):
         """单步自回归解码，使用显式 KV Cache 容器。"""
         if token_id.dim() == 1:
@@ -210,13 +215,16 @@ class LatexOCRModel(nn.Module):
         tgt_emb = self.text_embedding(token_id) * math.sqrt(self.d_model)
         tgt_emb = self._apply_position_embeddings(tgt_emb, start_pos=start_pos)
 
-        decoder_out, new_cache = self.decoder.forward_step_cached(
+        decoder_out, new_cache, attn_weights = self.decoder.forward_step_cached(
             text_embeddings=tgt_emb,
             cross_features=memory,
             cache=cache,
             memory_key_padding_mask=memory_padding_mask,
+            return_attn_weights=return_attn_weights,
         )
         logits = self.head(decoder_out.squeeze(1))
+        if return_attn_weights:
+            return logits, new_cache, attn_weights
         return logits, new_cache
 
     def forward(

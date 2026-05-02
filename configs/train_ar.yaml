@@ -2,7 +2,7 @@ data:
   train_h5:
     - C:/Projects/LatexProject/ConvResFormula/datasets/train.h5 # 手写训练集
     - C:/Projects/LatexProject/ConvResFormula/datasets/synthetic.h5 # 合成训练集
-    - C:/Projects/LatexProject/ConvResFormula/datasets/symbols96.h5 # 单字符训练集
+    - C:/Projects/LatexProject/ConvResFormula/datasets/symbols.h5 # 单字符训练集
     - C:/Projects/LatexProject/ConvResFormula/datasets/wiki_train_314k.h5 # wiki训练集
   eval_h5: C:/Projects/LatexProject/ConvResFormula/datasets/val.h5 # 验证/评估集
   tokenizer: C:/Projects/LatexProject/ConvResFormula/tokenizer_bpe.json # BPE 分词器
@@ -13,8 +13,8 @@ training:
   num_workers: 4 # 训练 DataLoader 线程数
   epochs: 30 # 总训练轮数
   seed: 42 # 随机种子
-  mix_ratio: [4, 3, 1,2] # 多数据源采样比例，真实手写:合成手写:单字符手写:wiki
-  epoch_samples: 524288 # 每个 epoch 的采样总数，<=0 表示全量
+  mix_ratio: [4, 4, 1,1] # 多数据源采样比例，真实手写:合成手写:单字符手写:wiki
+  epoch_samples: 393216 # 每个 epoch 的采样总数，<=0 表示全量
   bucket_mega_factor: 64 # 分桶 mega-batch 系数
   decoder_input_noise_ratio: 0.08 # 解码器输入随机 Token 替换概率（缓解曝光偏差）
 
@@ -42,7 +42,7 @@ augmentation:
     alpha_max: 1.2
 
 augmentation_extreme:  
-  enable: true  # 是否启用极限增强，极限增强包含更激烈的变换
+  enable: false  # 是否启用极限增强，极限增强包含更激烈的变换
   grid_distortion:
     prob: 0.5
     num_steps: 5
@@ -79,7 +79,7 @@ eval:
 runtime:
   ckpt_dir: checkpoints/ar # checkpoint 输出目录
   log_dir: logs/ar_logs # 日志输出目录
-  resume_ckpt: checkpoints\ar\epoch_20_stripped.pth # 恢复训练使用的 checkpoint
+  resume_ckpt: checkpoints\ar\epoch_28.pth # 恢复训练使用的 checkpoint
   resume: True # 是否默认启用断点恢复
   amp_dtype: fp16 # 训练精度类型(fp16/bf16/fp32)
   cudnn_benchmark: True # 启用 cudnn benchmark 模式以优化卷积性能

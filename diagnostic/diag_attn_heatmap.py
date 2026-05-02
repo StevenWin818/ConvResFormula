@@ -19,6 +19,49 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+
+def save_attention_heatmaps(image_tensor, token_ids, attn_weights_list, tokenizer, save_dir="logs/attn_heatmaps"):
+    Path(save_dir).mkdir(parents=True, exist_ok=True)
+    img = image_tensor.cpu().numpy()[0]
+    H, W = img.shape
+    H_feat, W_feat = H // 32, W // 32
+    
+    img_display = (img * 255).astype(np.uint8)
+    if len(img_display.shape) == 2:
+        img_display = cv2.cvtColor(img_display, cv2.COLOR_GRAY2RGB)
+        
+    print(f"\n🖼️ 正在导出注意力热力图到 {save_dir} (序列长度: {len(token_ids)})")
+    
+    for step, (token_id, layers_attn) in enumerate(zip(token_ids, attn_weights_list)):
+        last_layer_attn = layers_attn[-1]
+        attn_map = last_layer_attn.mean(dim=1).squeeze(0).squeeze(0)
+        attn_map = attn_map.view(H_feat, W_feat).cpu().float().numpy()
+        attn_map_resized = cv2.resize(attn_map, (W, H), interpolation=cv2.INTER_LINEAR)
+        attn_map_norm = (attn_map_resized - attn_map_resized.min()) / (attn_map_resized.max() - attn_map_resized.min() + 1e-8)
+        
+        heatmap = cv2.applyColorMap((attn_map_norm * 255).astype(np.uint8), cv2.COLORMAP_JET)
+        overlay = cv2.addWeighted(img_display, 0.4, heatmap, 0.6, 0)
+        
+        char_str = tokenizer.decode([token_id]) if tokenizer else str(token_id)
+        
+        plt.figure(figsize=(12, 5))
+        plt.subplot(1, 2, 1)
+        plt.imshow(img_display)
+        plt.title("Original Image")
+        plt.axis('off')
+        
+        plt.subplot(1, 2, 2)
+        plt.imshow(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
+        plt.title(f"Step {step+1}: Predict [ {char_str} ]")
+        plt.axis('off')
+        
+        plt.tight_layout()
+        plt.savefig(f"{save_dir}/step_{step:03d}.png", dpi=150)
+        plt.close()
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
 	sys.path.insert(0, str(PROJECT_ROOT))
@@ -267,7 +310,6 @@ def robust_normalize_tex(tex: str) -> str:
 	# 3. 保留 \left 和 \right，避免大括号尺寸差异被错误归一
 
 	# 4. 剥离无意义的安全括号包裹 (处理类似 \gcd({S_{i}}) -> \gcd(S_{i}) 的问题)
-	# 循环执行 3 次以应对可能的嵌套包裹
 	for _ in range(3):
 		# 仅剥离“完整包裹”的冗余花括号，支持嵌套内容且不破坏合法结构。
 		tex = _unwrap_delimiter_wrapped_group(tex, "(", ")")
@@ -725,6 +767,7 @@ def batched_infer_ar(
 	amp_enabled: bool,
 	amp_dtype: torch.dtype,
 	beam_size: int = 1,
+	tokenizer: Optional[Tokenizer] = None,
 ) -> List[List[int]]:
 	"""批量版 AR 解码，支持贪心与束搜索 (Beam Search)。"""
 	batch_size = images.size(0)
@@ -740,16 +783,23 @@ def batched_infer_ar(
 		generated[:, 0] = bos_id
 		finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
 		
+		is_single_batch = (batch_size == 1)
+		collected_attns = []
+
 		for step in range(1, max_len):
 			with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
 				current_token = generated[:, step - 1]
-				logits, decode_cache, _attn_weights = model.decode_step_cached(
+				logits, decode_cache, attn_weights = model.decode_step_cached(
 					memory=memory,
 					token_id=current_token,
 					cache=decode_cache,
 					memory_padding_mask=memory_padding_mask,
 					return_attn_weights=True
 				)
+
+			if is_single_batch and attn_weights is not None:
+				detached_attns = [aw.detach().cpu() for aw in attn_weights]
+				collected_attns.append(detached_attns)
 
 			next_tokens = logits.argmax(dim=-1)
 			next_tokens = next_tokens.masked_fill(finished, pad_id)
@@ -764,6 +814,14 @@ def batched_infer_ar(
 			if eos_id in row:
 				row = row[: row.index(eos_id)]
 			output_batch.append(row)
+
+		if is_single_batch and len(collected_attns) > 0:
+			save_attention_heatmaps(
+				image_tensor=images[0], 
+				token_ids=output_batch[0][1:],
+				attn_weights_list=collected_attns,
+				tokenizer=tokenizer
+			)
 
 		return output_batch
 
@@ -789,7 +847,7 @@ def batched_infer_ar(
 	for step in range(1, max_len):
 		with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
 			current_token = generated[:, step - 1]
-			logits, decode_cache, = model.decode_step_cached(
+			logits, decode_cache = model.decode_step_cached(
 				memory=memory,
 				token_id=current_token,
 				cache=decode_cache,
@@ -1011,6 +1069,7 @@ def evaluate(args: argparse.Namespace) -> Tuple[float, float, int]:
 				amp_enabled=amp_enabled,
 				amp_dtype=eval_amp_dtype,
 				beam_size=args.beam_size,
+				tokenizer=tokenizer,
 			)
 
 			for i in range(len(pred_batch)):

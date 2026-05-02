@@ -100,12 +100,28 @@ class ARTrainer:
         if self.scaler is not None:
             old_scale = float(self.scaler.get_scale())
             self.scaler.unscale_(self.optimizer)
+            
+            # Gradient probe BEFORE clip
+            try:
+                enc_norm = torch.nn.utils.clip_grad_norm_(self.model.encoder.parameters(), max_norm=float('inf')).item()
+                dec_norm = torch.nn.utils.clip_grad_norm_(self.model.decoder.parameters(), max_norm=float('inf')).item()
+                # tqdm.write(f"Grad Norm Probes -> Enc: {enc_norm:.3f}, Dec: {dec_norm:.3f}")
+            except Exception:
+                pass
+                
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.scaler.step(self.optimizer)
             self.scaler.update()
             new_scale = float(self.scaler.get_scale())
             return new_scale >= old_scale
         else:
+            # Gradient probe BEFORE clip
+            try:
+                enc_norm = torch.nn.utils.clip_grad_norm_(self.model.encoder.parameters(), max_norm=float('inf')).item()
+                dec_norm = torch.nn.utils.clip_grad_norm_(self.model.decoder.parameters(), max_norm=float('inf')).item()
+            except Exception:
+                pass
+                
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
             return True
@@ -211,19 +227,8 @@ class ARTrainer:
 
                     if self.scaler is not None:
                         self.scaler.scale(loss).backward()
-                        
-                        # 记录 unscale 之前的梯度范数探针
-                        self.scaler.unscale_(self.optimizer)
                     else:
                         loss.backward()
-
-                    # Gradient probe
-                    try:
-                        enc_norm = torch.nn.utils.clip_grad_norm_(self.model.encoder.parameters(), max_norm=float('inf')).item()
-                        dec_norm = torch.nn.utils.clip_grad_norm_(self.model.decoder.parameters(), max_norm=float('inf')).item()
-                        # tqdm.write(f"Grad Norm Probes -> Enc: {enc_norm:.3f}, Dec: {dec_norm:.3f}, Ratio(Dec/Enc): {(dec_norm/enc_norm if enc_norm > 0 else 0):.3f}")
-                    except Exception:
-                        pass
 
                     preds = logits.argmax(dim=-1)
                     if valid_mask.any():
