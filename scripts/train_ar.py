@@ -241,6 +241,10 @@ def apply_config_defaults(args: argparse.Namespace, train_cfg: Dict[str, Any], m
 
 	args.decoder_input_noise_ratio = args.decoder_input_noise_ratio if args.decoder_input_noise_ratio is not None else float(_cfg_get(train_cfg, ("training", "decoder_input_noise_ratio"), 0.08))
 
+	args.reset_lr = getattr(args, "reset_lr", None)
+	if args.reset_lr is None:
+		args.reset_lr = bool(_cfg_get(train_cfg, ("runtime", "reset_lr"), False))
+
 	args.warmup_epochs = args.warmup_epochs if args.warmup_epochs is not None else float(_cfg_get(train_cfg, ("scheduler", "warmup_epochs"), 1.0))
 	args.warmup_start_lr = args.warmup_start_lr if args.warmup_start_lr is not None else float(_cfg_get(train_cfg, ("scheduler", "warmup_start_lr"), 1e-7))
 	args.eta_min = args.eta_min if args.eta_min is not None else float(_cfg_get(train_cfg, ("scheduler", "eta_min"), 1e-6))
@@ -1158,7 +1162,9 @@ def main() -> None:
 				print(f"警告: EMA module 状态与当前模型不兼容，已跳过恢复。原因: {exc}")
 
 		# 安全检查：只有当 checkpoint 里确实包含 optimizer 时才去加载
-		if "optimizer" in checkpoint and "scheduler" in checkpoint:
+		if getattr(args, "reset_lr", False):
+			print("提示: 已启用 reset_lr，跳过加载 optimizer/scheduler 状态，触发冷启动预热阶段。")
+		elif "optimizer" in checkpoint and "scheduler" in checkpoint:
 			try:
 				optimizer.load_state_dict(checkpoint["optimizer"])
 				scheduler.load_state_dict(checkpoint["scheduler"])

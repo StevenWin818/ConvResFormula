@@ -301,6 +301,7 @@ def build_model(
         vocab_size=vocab_size,
         d_model=d_model,
         pad_id=pad_id,
+        vision_pretrained=False, # 推理时不需要预先下载 ImageNet 权重
         use_gradient_checkpointing=False,
         checkpoint_decoder_layers=False,
     ).to(device)
@@ -367,7 +368,7 @@ def run_inference(args: argparse.Namespace, out_dir: Path) -> Path:
         writer = csv.writer(f)
         writer.writerow(["sample_id", "latex"])
 
-        for batch in tqdm(loader, desc="CROHME2019 推理"):
+        for batch in tqdm(loader, desc="CROHME 推理"):
             sample_ids = batch["sample_ids"]
             images = batch["images"].to(device)
 
@@ -627,9 +628,9 @@ def run_lgeval(pred_symlg_dir: Path, gt_symlg_dir: Path, lgeval_root: Path) -> P
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="CROHME2019 PNG 数据评估脚本")
-    parser.add_argument("--image_root", type=str, default=r"C:\Projects\LatexProject\CROHME\test\CROHME2019_test")
+    parser.add_argument("--image_root", type=str, default=r"C:\Projects\LatexProject\CROHME\IMG\test\CROHME2019_test")
     parser.add_argument("--tokenizer", type=str, default=r"C:\Projects\LatexProject\ConvResFormula\tokenizer_bpe.json")
-    parser.add_argument("--checkpoint", type=str, default=r"C:\Projects\LatexProject\ConvResFormula\checkpoints\ar\best.pth")
+    parser.add_argument("--checkpoint", type=str, default=r"C:\Projects\LatexProject\ConvResFormula\checkpoints\ar\epoch_30.pth")
     parser.add_argument("--d_model", type=int, default=256)
     parser.add_argument("--max_area", type=int, default=98304)
     parser.add_argument("--batch_size", type=int, default=16)
@@ -637,7 +638,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_len", type=int, default=160)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--amp_dtype", type=str, choices=["fp16", "bf16", "fp32"], default="bf16")
-    parser.add_argument("--beam_size", type=int, default=1, help="Beam Search size. 1 selects greedy decoding")
+    parser.add_argument("--beam_size", type=int, default=3, help="Beam Search size. 1 selects greedy decoding")
 
     parser.add_argument("--out_dir", type=str, default="")
 

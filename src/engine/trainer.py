@@ -165,11 +165,12 @@ class ARTrainer:
                         apply_mask = prob_mask & valid_mask
 
                         # 生成全局随机 Token (范围在 0 到 vocab_size-1 之间)
-                        # vocab_size = int(getattr(self.model, "vocab_size", int(ar_in_chunk.max().item()) + 1))
-                        # random_tokens = torch.randint_like(ar_in_chunk, low=0, high=vocab_size)
-
-                        # 应用噪声：命中 apply_mask 的位置替换为遮盖 Token
-                        ar_in_chunk_noisy = torch.where(apply_mask, self.pad_id, ar_in_chunk)
+                        # 使用固定的 [MASK] Token (ID=4) 替换被选中的 Token
+                        # 避免使用 pad_id，因为 pad_id 会被 tgt_key_padding_mask 完全从注意力矩阵中抹除
+                        mask_id = getattr(self.model, "mask_id", 4)
+                        
+                        # 应用噪声：命中 apply_mask 的位置替换为 MASK Token
+                        ar_in_chunk_noisy = torch.where(apply_mask, torch.tensor(mask_id, dtype=ar_in_chunk.dtype, device=ar_in_chunk.device), ar_in_chunk)
                     else:
                         ar_in_chunk_noisy = ar_in_chunk
                     # ==========================================
@@ -218,7 +219,8 @@ class ARTrainer:
                         if self.enable_sigreg and sigreg_embedding is not None and self.sigreg_loss_fn is not None:
                             # 通过池化重建视觉 padding mask (True 表示图片有效区域)
                             with torch.no_grad():
-                                downsampled = F.max_pool2d(img_chunk, kernel_size=32, stride=32)
+                                stride = getattr(self.model.encoder, "downsample_stride", 32)
+                                downsampled = F.max_pool2d(img_chunk, kernel_size=stride, stride=stride)
                                 sigreg_mask = (downsampled.view(img_chunk.size(0), -1) > 1e-5)
                             
                             sigreg_loss = self.sigreg_loss_fn(sigreg_embedding, mask=sigreg_mask)

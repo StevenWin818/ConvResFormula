@@ -6,12 +6,12 @@ data:
     - C:/Projects/LatexProject/ConvResFormula/datasets/wiki_train_314k.h5 # wiki训练集
   eval_h5: C:/Projects/LatexProject/ConvResFormula/datasets/val.h5 # 验证/评估集
   tokenizer: C:/Projects/LatexProject/ConvResFormula/tokenizer_bpe.json # BPE 分词器
-  max_area: 98304 # 图像动态缩放的面积上限
+  max_area: 150000 # 图像动态缩放的面积上限
 
 training:
   batch_size: 32 # 训练 batch 大小
   num_workers: 4 # 训练 DataLoader 线程数
-  epochs: 30 # 总训练轮数
+  epochs: 50 # 总训练轮数
   seed: 42 # 随机种子
   mix_ratio: [4, 4, 1,1] # 多数据源采样比例，真实手写:合成手写:单字符手写:wiki
   epoch_samples: 393216 # 每个 epoch 的采样总数，<=0 表示全量
@@ -42,7 +42,7 @@ augmentation:
     alpha_max: 1.2
 
 augmentation_extreme:  
-  enable: false  # 是否启用极限增强，极限增强包含更激烈的变换
+  enable: true  # 是否启用极限增强，极限增强包含更激烈的变换
   grid_distortion:
     prob: 0.5
     num_steps: 5
@@ -79,8 +79,9 @@ eval:
 runtime:
   ckpt_dir: checkpoints/ar # checkpoint 输出目录
   log_dir: logs/ar_logs # 日志输出目录
-  resume_ckpt: checkpoints\ar\epoch_28.pth # 恢复训练使用的 checkpoint
+  resume_ckpt: checkpoints\ar\epoch_30.pth # 恢复训练使用的 checkpoint
   resume: True # 是否默认启用断点恢复
+  reset_lr: False # 是否在恢复断点时重置学习率和优化器状态（用于触发 Warm Restarts）
   amp_dtype: fp16 # 训练精度类型(fp16/bf16/fp32)
   cudnn_benchmark: True # 启用 cudnn benchmark 模式以优化卷积性能
   channels_last: False # 启用 channels_last 内存格式

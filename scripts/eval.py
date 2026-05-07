@@ -845,7 +845,7 @@ def batched_infer_ar(
 	lengths = (generated != pad_id).sum(dim=2).float()
 
 	# 2. 在终点线进行全局长度惩罚
-	alpha = 0.8
+	alpha = 1.2
 	# 注意：因为分数是负数，除以一个大于 1 的长度因子，反而会让长句子的负分变小
 	# 但 PyTorch 中的 Log-Prob 通常直接除以长度。如果你发现模型过于偏向超长乱码，可以调整 alpha 为 0.6 甚至 0.5
 	penalized_scores = beam_scores / (lengths ** alpha)

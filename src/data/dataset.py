@@ -10,6 +10,11 @@ from torch.utils.data import Dataset
 from tokenizers import Tokenizer
 from typing import Tuple, Dict, Any, Optional
 
+import os
+
+# 禁用 albumentations 的网络版本检查，避免多进程 DataLoader 启动时严重超时与警告
+os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
+
 try:
     import albumentations as A
 except ImportError:
@@ -182,9 +187,14 @@ class FormulaDataset(Dataset):
         
         # 2. 图像解码与动态分辨率缩放
         img_buffer = np.frombuffer(img_bytes, np.uint8)
+        if len(img_buffer) == 0:
+            print(f"⚠️ 警告: 发现空图像数据 idx={idx}, path={self.h5_path}，已自动跳过并替换为下一个样本。")
+            return self.__getitem__((idx + 1) % self.length)
+
         img = cv2.imdecode(img_buffer, cv2.IMREAD_GRAYSCALE)
         if img is None:
-            raise RuntimeError(f"图像解码失败: idx={idx}, path={self.h5_path}")
+            print(f"⚠️ 警告: 图像解码失败 idx={idx}, path={self.h5_path}，已自动跳过并替换为下一个样本。")
+            return self.__getitem__((idx + 1) % self.length)
 
         h_orig, w_orig = img.shape
         target_h, target_w = calculate_dynamic_dims(h_orig, w_orig, max_area=self.max_area, stride=32)

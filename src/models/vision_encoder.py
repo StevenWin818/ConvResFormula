@@ -69,20 +69,19 @@ class ConvNeXtV2Encoder(nn.Module):
         use_gradient_checkpointing: bool = True,
     ):
         super().__init__()
+        self.downsample_stride = 16 # 改为输出 16 倍下采样特征以提高细节分辨率
         
         # 1. 使用 timm 拉取预训练骨干网络
-        # features_only=True 表示我们不要它的全连接层和分类头，只要输出的特征图
         print(f"🚀 初始化视觉骨干: {model_name} (Pretrained={pretrained})")
         self.backbone = timm.create_model(
             model_name,
             pretrained=pretrained,
-            in_chans=in_chans,    # 直接支持单通道灰度图！timm会自动处理预训练权重的合并
+            in_chans=3,    # 强制 3 通道，容纳 CoordConv (Gray, X, Y)
             features_only=True,
-            out_indices=(-1,),     # 只取最后一次下采样（32倍）的特征图
-            drop_path_rate=drop_path_rate,  # 传递 drop_path_rate 参数
+            out_indices=(-2, -1),     # 提取 Stride 16 和 Stride 32 两层特征
+            drop_path_rate=drop_path_rate,
         )
 
-        # 通过开关控制 timm 原生细粒度梯度检查点（Stage/Layer 内部分段释放）
         set_grad_checkpointing = getattr(self.backbone, "set_grad_checkpointing", None)
         if callable(set_grad_checkpointing):
             set_grad_checkpointing_fn = cast(Callable[[bool], Any], set_grad_checkpointing)
@@ -92,20 +91,19 @@ class ConvNeXtV2Encoder(nn.Module):
             else:
                 print("ℹ️ 视觉主干网络内部 Layer-level 梯度检查点已关闭。")
         
-        # 获取 ConvNeXt 最后一层的输出通道数 (pico 是 512, nano 是 640)
-        # 强制转换为 int 来消除 Pylance 的类型推断噪音
         feature_info: Any = self.backbone.feature_info
-        backbone_out_channels: int = int(feature_info[-1]['num_chs'])
+        ch_16 = int(feature_info[-2]['num_chs'])
+        ch_32 = int(feature_info[-1]['num_chs'])
         
-        # 2. 维度投影层 (Projection)
-        # 将 ConvNeXt 的输出通道数映射为 Decoder 需要的 d_model
-        self.proj = nn.Conv2d(backbone_out_channels, d_model, kernel_size=1)
+        # 2. 维度投影层与 FPN 融合
+        self.proj_16 = nn.Conv2d(ch_16, d_model, kernel_size=1)
+        self.proj_32 = nn.Conv2d(ch_32, d_model, kernel_size=1)
+        self.fpn_fusion = nn.Conv2d(d_model, d_model, kernel_size=3, padding=1)
         
-        # 3. 2D 位置编码
-        # 注意：这里的 max_h 和 max_w 是指“特征图”的最大尺寸。
-        self.pos_encoder = PositionalEncoding2D(d_model=d_model, max_h=128, max_w=1024)
+        # 3. 2D 位置编码 (调整 max 尺寸以适应 stride 16)
+        self.pos_encoder = PositionalEncoding2D(d_model=d_model, max_h=256, max_w=2048)
 
-        # 4. BoW 辅助头：预测图像中各符号是否出现（多标签）
+        # 4. BoW 辅助头
         self.bow_head = nn.Linear(d_model, int(ctc_vocab_size))
 
     def forward(
@@ -128,22 +126,35 @@ class ConvNeXtV2Encoder(nn.Module):
         """
         import torch.nn.functional as F
 
-        # 1. 骨干网络提取二维特征图
-        # 输出尺寸: [Batch, C, H_feat, W_feat]
-        backbone_output: Any = self.backbone(x)
-        features: torch.Tensor = backbone_output[0] 
+        b, c, h, w = x.size()
         
-        # 2. 投影到 d_model
-        features = self.proj(features)
+        # 0. 构造 CoordConv
+        if c == 1:
+            y_coords = torch.linspace(-1.0, 1.0, steps=h, device=x.device, dtype=x.dtype).view(1, 1, h, 1).expand(b, 1, h, w)
+            x_coords = torch.linspace(-1.0, 1.0, steps=w, device=x.device, dtype=x.dtype).view(1, 1, 1, w).expand(b, 1, h, w)
+            x_in = torch.cat([x, x_coords, y_coords], dim=1)
+        else:
+            x_in = x
+
+        # 1. 骨干提取 (多层特征)
+        backbone_output: Any = self.backbone(x_in)
+        feat_16: torch.Tensor = backbone_output[0] # Stride 16
+        feat_32: torch.Tensor = backbone_output[1] # Stride 32
+        
+        # 2. FPN 融合到 Stride 16
+        p_16 = self.proj_16(feat_16)
+        p_32 = self.proj_32(feat_32)
+        p_32_up = F.interpolate(p_32, size=p_16.shape[2:], mode='bilinear', align_corners=False)
+        features = self.fpn_fusion(p_16 + p_32_up)
         
         # 3. 注入二维物理绝对位置信息
         features = self.pos_encoder(features)
         
-        # 4. 构造视觉 memory 的 padding mask
-        b, c, h_feat, w_feat = features.size()
+        # 4. 构造视觉 memory 的 padding mask (按下采样步长 16)
+        b_f, c_f, h_feat, w_feat = features.size()
         with torch.no_grad():
-            downsampled_mask = F.max_pool2d(x, kernel_size=32, stride=32)
-            memory_padding_mask = (downsampled_mask.view(b, -1) <= 1e-5)
+            downsampled_mask = F.max_pool2d(x, kernel_size=16, stride=16)
+            memory_padding_mask = (downsampled_mask.view(b_f, -1) <= 1e-5)
 
         bow_logits = None
         if return_aux:

@@ -197,7 +197,9 @@ def build_dataset(name: str, source_h5: str, target_h5: str, tokenizer: Tokenize
                 if l > 0: strokes.append(points[cursor:cursor+l])
                 cursor += l
                 
-            img = render_adaptive_stroke_scale(strokes, target_stroke_diag=80.0, base_thickness=4)
+            # 随机粗细 1-5 像素，增强书写多样性与泛化性
+            random_thickness = int(np.random.randint(1, 6))
+            img = render_adaptive_stroke_scale(strokes, target_stroke_diag=80.0, base_thickness=random_thickness)
             if img is None: continue
             
             # 步长严格对齐 32
@@ -244,21 +246,21 @@ if __name__ == "__main__":
 
     # === 2. 配置数据集  ===
     DATASETS_TO_BUILD = [
-        # ("手写训练集 (Train)", 
-        #  r"C:\Projects\LatexProject\datasets\train.h5", 
-        #  r"C:\Projects\LatexProject\ConvResFormula\datasets\train.h5", DEFAULT_TARGET_H),
+        ("手写训练集 (Train)", 
+         r"C:\Projects\LatexProject\datasets\train.h5", 
+         r"C:\Projects\LatexProject\ConvResFormula\datasets\train.h5", DEFAULT_TARGET_H),
          
         ("手写验证集 (Val)", 
          r"C:\Projects\LatexProject\datasets\val.h5", 
-         r"C:\Projects\LatexProject\ConvResFormula\datasets\val_1.h5", DEFAULT_TARGET_H),
+         r"C:\Projects\LatexProject\ConvResFormula\datasets\val.h5", DEFAULT_TARGET_H),
          
-        # ("合成长公式 (Synthetic)", 
-        #  r"C:\Projects\LatexProject\datasets\synthetic.h5", 
-        #  r"C:\Projects\LatexProject\ConvResFormula\datasets\synthetic.h5", DEFAULT_TARGET_H),
+        ("合成长公式 (Synthetic)", 
+         r"C:\Projects\LatexProject\datasets\synthetic.h5", 
+         r"C:\Projects\LatexProject\ConvResFormula\datasets\synthetic.h5", DEFAULT_TARGET_H),
          
-        # ("单字符集 (Symbols)", 
-        #  r"C:\Projects\LatexProject\datasets\symbols.h5", 
-        #  r"C:\Projects\LatexProject\ConvResFormula\datasets\symbols.h5", DEFAULT_TARGET_H),
+        ("单字符集 (Symbols)", 
+         r"C:\Projects\LatexProject\datasets\symbols.h5", 
+         r"C:\Projects\LatexProject\ConvResFormula\datasets\symbols.h5", DEFAULT_TARGET_H),
     ]
 
     for name, src, dst, target_h in DATASETS_TO_BUILD:
