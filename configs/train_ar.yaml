@@ -6,12 +6,12 @@ data:
     - C:/Projects/LatexProject/ConvResFormula/datasets/wiki_train_314k.h5 # wiki训练集
   eval_h5: C:/Projects/LatexProject/ConvResFormula/datasets/val.h5 # 验证/评估集
   tokenizer: C:/Projects/LatexProject/ConvResFormula/tokenizer_bpe.json # BPE 分词器
-  max_area: 150000 # 图像动态缩放的面积上限
+  max_area: 120000 # 图像动态缩放的面积上限
 
 training:
   batch_size: 32 # 训练 batch 大小
   num_workers: 4 # 训练 DataLoader 线程数
-  epochs: 50 # 总训练轮数
+  epochs: 60 # 总训练轮数
   seed: 42 # 随机种子
   mix_ratio: [4, 4, 1,1] # 多数据源采样比例，真实手写:合成手写:单字符手写:wiki
   epoch_samples: 393216 # 每个 epoch 的采样总数，<=0 表示全量
@@ -23,7 +23,7 @@ optimization:
   decoder_lr: 1.0e-5 # 解码器学习率
   weight_decay: 1.0e-2 # AdamW 权重衰减
   label_smoothing: 0.15 # 交叉熵标签平滑，提升泛化能力
-  bow_weight: 1.0 # BoW 辅助损失权重
+  bow_weight: 1.6 # BoW 辅助损失权重
   ohem_ratio: 0.5 # OHEM 困难样本保留比例，设为 1.0 即不使用 OHEM
   enable_sigreg: true # 是否启用 SIGReg-like 正则化
   sigreg_weight: 0.08 # SIGReg-like 损失权重
@@ -79,7 +79,7 @@ eval:
 runtime:
   ckpt_dir: checkpoints/ar # checkpoint 输出目录
   log_dir: logs/ar_logs # 日志输出目录
-  resume_ckpt: checkpoints\ar\epoch_30.pth # 恢复训练使用的 checkpoint
+  resume_ckpt: checkpoints\ar\epoch_45.pth # 恢复训练使用的 checkpoint
   resume: True # 是否默认启用断点恢复
   reset_lr: False # 是否在恢复断点时重置学习率和优化器状态（用于触发 Warm Restarts）
   amp_dtype: fp16 # 训练精度类型(fp16/bf16/fp32)

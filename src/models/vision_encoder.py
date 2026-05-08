@@ -100,8 +100,23 @@ class ConvNeXtV2Encoder(nn.Module):
         self.proj_32 = nn.Conv2d(ch_32, d_model, kernel_size=1)
         self.fpn_fusion = nn.Conv2d(d_model, d_model, kernel_size=3, padding=1)
         
+        # 安全初始化：确保在加载旧权重（没有 FPN 参数）时，FPN 模块等价于直通 (Identity)，防止输出随机乱码
+        nn.init.zeros_(self.proj_16.weight)
+        nn.init.zeros_(self.proj_16.bias)
+        nn.init.dirac_(self.fpn_fusion.weight)
+        nn.init.zeros_(self.fpn_fusion.bias)
+        
         # 3. 2D 位置编码 (调整 max 尺寸以适应 stride 16)
         self.pos_encoder = PositionalEncoding2D(d_model=d_model, max_h=256, max_w=2048)
+
+        # 预计算最大尺寸的坐标网格，用于 CoordConv (避免动态形状下 torch.linspace 触发编译回退)
+        max_coord_h, max_coord_w = 2048, 2048
+        y_pos = torch.arange(max_coord_h).view(1, 1, max_coord_h, 1)
+        x_pos = torch.arange(max_coord_w).view(1, 1, 1, max_coord_w)
+        self.register_buffer("y_pos", y_pos, persistent=False)
+        self.register_buffer("x_pos", x_pos, persistent=False)
+        self.y_pos: torch.Tensor
+        self.x_pos: torch.Tensor
 
         # 4. BoW 辅助头
         self.bow_head = nn.Linear(d_model, int(ctc_vocab_size))
@@ -128,11 +143,13 @@ class ConvNeXtV2Encoder(nn.Module):
 
         b, c, h, w = x.size()
         
-        # 0. 构造 CoordConv
+        # 0. 构造 CoordConv (兼容 torch.compile 的符号化形状推导)
         if c == 1:
-            y_coords = torch.linspace(-1.0, 1.0, steps=h, device=x.device, dtype=x.dtype).view(1, 1, h, 1).expand(b, 1, h, w)
-            x_coords = torch.linspace(-1.0, 1.0, steps=w, device=x.device, dtype=x.dtype).view(1, 1, 1, w).expand(b, 1, h, w)
-            x_in = torch.cat([x, x_coords, y_coords], dim=1)
+            # 取出对应尺寸的预计算坐标，并做 -1 到 1 的归一化
+            # (h - 1) 可能为 0，所以加 1e-5 防除零
+            y_coords = (self.y_pos[:, :, :h, :w].expand(b, 1, h, w).float() / (h - 1 + 1e-5)) * 2.0 - 1.0
+            x_coords = (self.x_pos[:, :, :h, :w].expand(b, 1, h, w).float() / (w - 1 + 1e-5)) * 2.0 - 1.0
+            x_in = torch.cat([x, x_coords.to(x.dtype), y_coords.to(x.dtype)], dim=1)
         else:
             x_in = x
 

@@ -127,7 +127,6 @@ class FormulaDataset(Dataset):
             A.ElasticTransform(
                 alpha=float(elastic_cfg.get("alpha", 1.0)),
                 sigma=float(elastic_cfg.get("sigma", 50.0)),
-                alpha_affine=float(elastic_cfg.get("alpha_affine", 50.0)),
                 p=float(elastic_cfg.get("prob", 0.5)),
             ),
         ]

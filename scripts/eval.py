@@ -845,7 +845,7 @@ def batched_infer_ar(
 	lengths = (generated != pad_id).sum(dim=2).float()
 
 	# 2. 在终点线进行全局长度惩罚
-	alpha = 1.2
+	alpha = 0.8
 	# 注意：因为分数是负数，除以一个大于 1 的长度因子，反而会让长句子的负分变小
 	# 但 PyTorch 中的 Log-Prob 通常直接除以长度。如果你发现模型过于偏向超长乱码，可以调整 alpha 为 0.6 甚至 0.5
 	penalized_scores = beam_scores / (lengths ** alpha)
@@ -902,10 +902,14 @@ def build_model(
 				for k, v in state_dict.items()
 			}
 	state_dict = convert_legacy_attnres_state_dict(state_dict)
-	model.load_state_dict(state_dict, strict=True)
+	incompatible = model.load_state_dict(state_dict, strict=False)
+	if incompatible.missing_keys:
+		print(f"警告(Eval): 缺失 {len(incompatible.missing_keys)} 个参数 (如新增的 FPN 融合层)。")
+	if incompatible.unexpected_keys:
+		print(f"警告(Eval): 多余 {len(incompatible.unexpected_keys)} 个参数。")
 	model.eval()
 	if enable_compile and hasattr(torch, "compile"):
-		model = cast(LatexOCRModel, torch.compile(model))
+		model = cast(LatexOCRModel, torch.compile(model, dynamic=True))
 	return model
 
 
