@@ -76,7 +76,7 @@ class ConvNeXtV2Encoder(nn.Module):
         self.backbone = timm.create_model(
             model_name,
             pretrained=pretrained,
-            in_chans=3,    # 强制 3 通道，容纳 CoordConv (Gray, X, Y)
+            in_chans=in_chans,    # 恢复单通道灰度图，彻底废弃 CoordConv
             features_only=True,
             out_indices=(-2, -1),     # 提取 Stride 16 和 Stride 32 两层特征
             drop_path_rate=drop_path_rate,
@@ -109,14 +109,18 @@ class ConvNeXtV2Encoder(nn.Module):
         # 3. 2D 位置编码 (调整 max 尺寸以适应 stride 16)
         self.pos_encoder = PositionalEncoding2D(d_model=d_model, max_h=256, max_w=2048)
 
-        # 预计算最大尺寸的坐标网格，用于 CoordConv (避免动态形状下 torch.linspace 触发编译回退)
-        max_coord_h, max_coord_w = 2048, 2048
-        y_pos = torch.arange(max_coord_h).view(1, 1, max_coord_h, 1)
-        x_pos = torch.arange(max_coord_w).view(1, 1, 1, max_coord_w)
-        self.register_buffer("y_pos", y_pos, persistent=False)
-        self.register_buffer("x_pos", x_pos, persistent=False)
-        self.y_pos: torch.Tensor
-        self.x_pos: torch.Tensor
+        # 4. 视觉自注意力层 (Transformer Encoder)
+        # 在 Stride 16 扩展出 4 倍 Token 后，建立视觉 Token 间的全局上下文
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=8,
+            dim_feedforward=d_model * 4,
+            dropout=0.1,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=2)
 
         # 4. BoW 辅助头
         self.bow_head = nn.Linear(d_model, int(ctc_vocab_size))
@@ -143,15 +147,8 @@ class ConvNeXtV2Encoder(nn.Module):
 
         b, c, h, w = x.size()
         
-        # 0. 构造 CoordConv (兼容 torch.compile 的符号化形状推导)
-        if c == 1:
-            # 取出对应尺寸的预计算坐标，并做 -1 到 1 的归一化
-            # (h - 1) 可能为 0，所以加 1e-5 防除零
-            y_coords = (self.y_pos[:, :, :h, :w].expand(b, 1, h, w).float() / (h - 1 + 1e-5)) * 2.0 - 1.0
-            x_coords = (self.x_pos[:, :, :h, :w].expand(b, 1, h, w).float() / (w - 1 + 1e-5)) * 2.0 - 1.0
-            x_in = torch.cat([x, x_coords.to(x.dtype), y_coords.to(x.dtype)], dim=1)
-        else:
-            x_in = x
+        # 0. 移除破坏平移不变性的绝对 CoordConv，直接使用原图
+        x_in = x
 
         # 1. 骨干提取 (多层特征)
         backbone_output: Any = self.backbone(x_in)
@@ -180,8 +177,18 @@ class ConvNeXtV2Encoder(nn.Module):
             bow_logits = self.bow_head(global_feat)
 
         # 5. 展平为 1D 序列 (从 2D 图变为文字序列一样的排布)
-        # [Batch, d_model, H_feat, W_feat] -> [Batch, d_model, H_feat * W_feat] -> [Batch, Seq_Len, d_model]
         sigreg_embedding = features.flatten(2).permute(0, 2, 1)  # [B, Seq_Len, d_model]
+        
+        # 6. Visual DropToken (随机丢弃视觉序列，强制全局注意力)
+        if self.training:
+            # 以 12% 的概率丢弃（置0）整个 Token 的特征
+            drop_mask = torch.rand(sigreg_embedding.shape[:2], device=sigreg_embedding.device) > 0.12
+            # 缩放以保持期望值
+            sigreg_embedding = (sigreg_embedding * drop_mask.unsqueeze(-1)) / 0.88
+
+        # 7. 视觉自注意力层 (建立高分辨率视觉 Token 的全局上下文)
+        # 注意: src_key_padding_mask 中 True 表示 padding，刚好符合 memory_padding_mask
+        sigreg_embedding = self.transformer_encoder(sigreg_embedding, src_key_padding_mask=memory_padding_mask)
         
         if return_aux and bow_logits is not None:
             return sigreg_embedding, memory_padding_mask, bow_logits, sigreg_embedding

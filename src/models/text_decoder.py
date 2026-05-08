@@ -47,14 +47,12 @@ def convert_legacy_attnres_state_dict(state_dict: dict) -> dict:
     if any(k.startswith("_orig_mod.") for k in converted.keys()):
         prefix = "_orig_mod."
 
-    # 兼容 CoordConv 升级：如果 checkpoint 中的 stem_0 是单通道的，而我们现在需要 3 通道 (Gray, X, Y)
-    # 我们用 0 填充新增的 X 和 Y 通道权重，这使得模型在加载权重的瞬间，计算结果与之前的单通道版本完全一致
+    # 兼容 CoordConv 移除：如果 checkpoint 中的 stem_0 是 3 通道 (CoordConv)，而我们现在回退到了单通道
+    # 丢弃 X 和 Y 通道权重，只保留第一个通道 (Gray 图像)
     stem_key = f"{prefix}encoder.backbone.stem_0.weight"
     stem_w = converted.get(stem_key)
-    if stem_w is not None and stem_w.dim() == 4 and stem_w.shape[1] == 1:
-        padded = torch.zeros(stem_w.shape[0], 3, stem_w.shape[2], stem_w.shape[3], dtype=stem_w.dtype, device=stem_w.device)
-        padded[:, 0:1, :, :] = stem_w
-        converted[stem_key] = padded
+    if stem_w is not None and stem_w.dim() == 4 and stem_w.shape[1] == 3:
+        converted[stem_key] = stem_w[:, 0:1, :, :]
 
     # 兼容 FPN 升级：将原本的 proj 权重映射给 proj_32
     proj_w_key = f"{prefix}encoder.proj.weight"
