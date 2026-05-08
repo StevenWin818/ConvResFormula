@@ -19,8 +19,9 @@ training:
   decoder_input_noise_ratio: 0.08 # 解码器输入随机 Token 替换概率（缓解曝光偏差）
 
 optimization:
-  encoder_lr: 6.0e-5 # 编码器学习率
-  decoder_lr: 1.0e-5 # 解码器学习率
+  encoder_lr: 2.0e-5 # 编码器主干网络学习率
+  fpn_lr: 1.5e-4 # FPN层与新增视觉自注意力层的学习率
+  decoder_lr: 8.0e-6 # 解码器学习率
   weight_decay: 1.0e-2 # AdamW 权重衰减
   label_smoothing: 0.15 # 交叉熵标签平滑，提升泛化能力
   bow_weight: 1.6 # BoW 辅助损失权重

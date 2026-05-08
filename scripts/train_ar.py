@@ -85,7 +85,8 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--disable_extreme_augment", dest="enable_extreme_augment", action="store_false", help="禁用极端数据增强（独立于标准增强）")
 	parser.set_defaults(enable_extreme_augment=None)
 
-	parser.add_argument("--encoder_lr", type=float, default=None, help=h("encoder_lr", "视觉编码器学习率"))
+	parser.add_argument("--encoder_lr", type=float, default=None, help=h("encoder_lr", "视觉编码器骨干学习率"))
+	parser.add_argument("--fpn_lr", type=float, default=None, help=h("fpn_lr", "视觉FPN及新增视觉自注意力层学习率"))
 	parser.add_argument("--decoder_lr", type=float, default=None, help=h("decoder_lr", "解码器学习率"))
 	parser.add_argument("--weight_decay", type=float, default=None, help=h("weight_decay", "权重衰减系数"))
 	parser.add_argument("--bow_weight", type=float, default=None, help="BoW 辅助损失权重")
@@ -453,29 +454,42 @@ def bootstrap_vs_build_env() -> bool:
 	return bool(os.environ.get("INCLUDE") and os.environ.get("LIB"))
 
 
-def build_optimizer(model: LatexOCRModel, encoder_lr: float, decoder_lr: float, weight_decay: float) -> optim.AdamW:
-	encoder_params: List[torch.nn.Parameter] = []
+def build_optimizer(model: LatexOCRModel, encoder_lr: float, decoder_lr: float, weight_decay: float, fpn_lr: float = None) -> optim.AdamW:
+	if fpn_lr is None:
+		fpn_lr = encoder_lr
+
+	encoder_backbone_params: List[torch.nn.Parameter] = []
+	encoder_fpn_params: List[torch.nn.Parameter] = []
 	other_params: List[torch.nn.Parameter] = []
 
 	for name, param in model.named_parameters():
 		if not param.requires_grad:
 			continue
-		# 兼容 torch.compile 后的参数名前缀（如 _orig_mod.encoder.xxx）
+		
+		# 识别是否是 Encoder 参数
 		if name.startswith("encoder.") or ".encoder." in name:
-			encoder_params.append(param)
+			# 将预训练的 backbone 与 新增的（FPN, PE, Transformer Encoder）分离
+			if "backbone" in name:
+				encoder_backbone_params.append(param)
+			else:
+				encoder_fpn_params.append(param)
 		else:
 			other_params.append(param)
 
-	if not encoder_params:
-		raise RuntimeError("未找到 encoder 可训练参数")
+	if not encoder_backbone_params:
+		raise RuntimeError("未找到 encoder_backbone 可训练参数")
 	if not other_params:
 		raise RuntimeError("未找到 decoder/head 可训练参数")
 
+	param_groups = [
+		{"params": encoder_backbone_params, "lr": encoder_lr},
+		{"params": other_params, "lr": decoder_lr},
+	]
+	if encoder_fpn_params:
+		param_groups.append({"params": encoder_fpn_params, "lr": fpn_lr})
+
 	return optim.AdamW(
-		[
-			{"params": encoder_params, "lr": encoder_lr},
-			{"params": other_params, "lr": decoder_lr},
-		],
+		param_groups,
 		weight_decay=weight_decay,
 	)
 
@@ -1108,6 +1122,7 @@ def main() -> None:
 		encoder_lr=args.encoder_lr,
 		decoder_lr=args.decoder_lr,
 		weight_decay=args.weight_decay,
+		fpn_lr=getattr(args, "fpn_lr", args.encoder_lr),
 	)
 
 	total_steps = infer_total_steps(args.epochs, len(train_batch_sampler))
