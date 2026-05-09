@@ -189,10 +189,9 @@ class ARTrainer:
                         vocab_size = logits.size(-1)
                         token_losses = self.criterion(logits.view(-1, vocab_size), ar_tgt_chunk.view(-1))
                         token_losses = token_losses.view(ar_tgt_chunk.size(0), -1)
-                        valid_mask = ar_tgt_chunk != self.target_ignore_index
-                        valid_counts = valid_mask.sum(dim=1).clamp(min=1).to(dtype=token_losses.dtype)
-
-                        per_sample_losses = (token_losses * valid_mask.to(dtype=token_losses.dtype)).sum(dim=1) / valid_counts
+                        # 直接求和并除以有效 Token 数，CrossEntropyLoss(ignore_index=...) 已经自动将无效位置设为 0
+                        valid_counts = (ar_tgt_chunk != self.target_ignore_index).sum(dim=1).clamp(min=1)
+                        per_sample_losses = token_losses.sum(dim=1) / valid_counts.to(dtype=token_losses.dtype)
                         keep_count = max(1, math.ceil(per_sample_losses.numel() * self.ohem_ratio))
                         top_losses = torch.topk(per_sample_losses, k=keep_count, largest=True).values
                         ce_loss = top_losses.mean()

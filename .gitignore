@@ -43,6 +43,7 @@ pip-wheel-metadata/
 /temp/
 *.log
 *.bak
+/docs_temp/
 
 # 缓存目录
 /cache/

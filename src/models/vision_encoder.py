@@ -101,8 +101,7 @@ class ConvNeXtV2Encoder(nn.Module):
         self.fpn_fusion = nn.Conv2d(d_model, d_model, kernel_size=3, padding=1)
         
         # 安全初始化：确保在加载旧权重（没有 FPN 参数）时，FPN 模块等价于直通 (Identity)，防止输出随机乱码
-        nn.init.zeros_(self.proj_16.weight)
-        nn.init.zeros_(self.proj_16.bias)
+        # 移除 proj_16 的全 0 初始化，让它使用默认的 Kaiming 初始化，配合高学习率快速收敛
         nn.init.dirac_(self.fpn_fusion.weight)
         nn.init.zeros_(self.fpn_fusion.bias)
         
@@ -170,26 +169,32 @@ class ConvNeXtV2Encoder(nn.Module):
             downsampled_mask = F.max_pool2d(x, kernel_size=16, stride=16)
             memory_padding_mask = (downsampled_mask.view(b_f, -1) <= 1e-5)
 
-        bow_logits = None
-        if return_aux:
-            # 全局平均池化得到 [B, d_model]，用于符号存在性预测
-            global_feat = features.mean(dim=(2, 3))
-            bow_logits = self.bow_head(global_feat)
-
         # 5. 展平为 1D 序列 (从 2D 图变为文字序列一样的排布)
         sigreg_embedding = features.flatten(2).permute(0, 2, 1)  # [B, Seq_Len, d_model]
         
         # 6. Visual DropToken (随机丢弃视觉序列，强制全局注意力)
         if self.training:
-            # 以 12% 的概率丢弃（置0）整个 Token 的特征
-            drop_mask = torch.rand(sigreg_embedding.shape[:2], device=sigreg_embedding.device) > 0.12
+            # 以 12% 的概率丢弃 (keep_mask 为 True 表示保留)
+            keep_mask = torch.rand(sigreg_embedding.shape[:2], device=sigreg_embedding.device) > 0.12
             # 缩放以保持期望值
-            sigreg_embedding = (sigreg_embedding * drop_mask.unsqueeze(-1)) / 0.88
+            sigreg_embedding = (sigreg_embedding * keep_mask.unsqueeze(-1)) / 0.88
+            
+            # 【核心修复 1】将丢弃的 Token 同步到掩码中，防止“幽灵 Token”干扰自注意力
+            # memory_padding_mask 中 True 表示无效位置
+            memory_padding_mask = memory_padding_mask | (~keep_mask)
 
         # 7. 视觉自注意力层 (建立高分辨率视觉 Token 的全局上下文)
-        # 注意: src_key_padding_mask 中 True 表示 padding，刚好符合 memory_padding_mask
         sigreg_embedding = self.transformer_encoder(sigreg_embedding, src_key_padding_mask=memory_padding_mask)
         
+        # 【核心修复 2】将 BoW 监督信号移动到 Transformer 之后，并修复平均池化
+        bow_logits = None
+        if return_aux:
+            # 排除 padding 和被 Drop 的 Token (True 表示无效)
+            valid_mask = (~memory_padding_mask).unsqueeze(-1).float() # [B, Seq_Len, 1]
+            # 计算有效 Token 的平均池化 [B, d_model]
+            global_feat = (sigreg_embedding * valid_mask).sum(dim=1) / valid_mask.sum(dim=1).clamp(min=1e-5)
+            bow_logits = self.bow_head(global_feat)
+
         if return_aux and bow_logits is not None:
             return sigreg_embedding, memory_padding_mask, bow_logits, sigreg_embedding
 
