@@ -641,9 +641,9 @@ def check_visual_equivalence(gt_tex: str, pred_tex: str, svg_renderer: NodeKatex
 
 def parse_args() -> argparse.Namespace:
 	parser = argparse.ArgumentParser(description="AR 解码评估脚本（SVG DOM 严格一致性）")
-	parser.add_argument("--eval_h5", type=str, default=r"C:\Projects\LatexProject\ConvResFormula\datasets\val.h5")
-	parser.add_argument("--tokenizer", type=str, default=r"C:\Projects\LatexProject\ConvResFormula\tokenizer_bpe.json")
-	parser.add_argument("--checkpoint", type=str, default=r"checkpoints\ar\best.pth")
+	parser.add_argument("--eval_h5", type=str, default=str(PROJECT_ROOT / "datasets" / "val.h5"))
+	parser.add_argument("--tokenizer", type=str, default=str(PROJECT_ROOT / "tokenizer_bpe.json"))
+	parser.add_argument("--checkpoint", type=str, default=str(PROJECT_ROOT / "checkpoints" / "ar" / "best.pth"))
 	parser.add_argument("--train_config", type=str, default=str(PROJECT_ROOT / "configs" / "train_ar.yaml"))
 	parser.add_argument("--model_config", type=str, default=str(PROJECT_ROOT / "configs" / "model_convnext_attnres.yaml"))
 	parser.add_argument("--d_model", type=int, default=256)
@@ -664,7 +664,7 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--checkpoint_decoder_layers", dest="checkpoint_decoder_layers", action="store_true", help="启用解码器层梯度检查点")
 	parser.add_argument("--no_checkpoint_decoder", dest="checkpoint_decoder_layers", action="store_false", help="禁用解码器层梯度检查点")
 	parser.set_defaults(checkpoint_decoder_layers=None)
-	parser.add_argument("--report_dir", type=str, default=r"logs\ar_logs")
+	parser.add_argument("--report_dir", type=str, default=str(PROJECT_ROOT / "logs" / "ar_logs"))
 	parser.add_argument("--log_interval", type=int, default=100)
 	parser.add_argument(
 		"--svg_node_script",

@@ -285,7 +285,7 @@ def apply_config_defaults(args: argparse.Namespace, train_cfg: Dict[str, Any], m
 
 	args.ckpt_dir = args.ckpt_dir or str(_cfg_get(train_cfg, ("runtime", "ckpt_dir"), r"checkpoints\ar"))
 	args.log_dir = args.log_dir or str(_cfg_get(train_cfg, ("runtime", "log_dir"), r"logs\ar_logs"))
-	args.resume_ckpt = args.resume_ckpt or str(_cfg_get(train_cfg, ("runtime", "resume_ckpt"), r"checkpoints\ar\latest.pth"))
+	args.resume_ckpt = args.resume_ckpt or str(_cfg_get(train_cfg, ("runtime", "resume_ckpt"), "checkpoints/ar/latest.pth"))
 	args.cudnn_benchmark = bool(_cfg_get(train_cfg, ("runtime", "cudnn_benchmark"), False))
 	if args.channels_last is None:
 		args.channels_last = bool(_cfg_get(train_cfg, ("runtime", "channels_last"), False))
@@ -319,7 +319,10 @@ def set_seed(seed: int) -> None:
 
 
 def ensure_msvc_cl_on_path() -> str:
-	"""在 Windows 下自动发现 cl.exe 并注入 PATH，返回 cl 路径；失败时返回空串。"""
+	"""保留兼容函数：仅在 Windows 环境尝试查找 cl.exe，否则返回空串。
+	但不要把 torch.compile 的可用性严格绑定到该函数；
+	使用环境变量 `TORCH_COMPILE` 来显式控制是否启用编译。
+	"""
 	if os.name != "nt":
 		return ""
 
@@ -327,6 +330,7 @@ def ensure_msvc_cl_on_path() -> str:
 	if cl_path:
 		return cl_path
 
+	# 尝试查找常见 VS 安装目录（保守处理）
 	roots = [os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles")]
 	editions = ("BuildTools", "Community", "Professional", "Enterprise", "Preview")
 	candidates: List[Path] = []
@@ -491,6 +495,7 @@ def build_optimizer(model: LatexOCRModel, encoder_lr: float, decoder_lr: float, 
 	return optim.AdamW(
 		param_groups,
 		weight_decay=weight_decay,
+		fused=True
 	)
 
 
@@ -1087,24 +1092,32 @@ def main() -> None:
 		checkpoint_decoder_layers=args.checkpoint_decoder_layers if args.checkpoint_decoder_layers is not None else False,
 	).to(device)
 	if args.channels_last:
-		model = model.to(memory_format=torch.channels_last) # type: ignore
-	if os.name == "nt":
-		if bootstrap_vs_build_env():
-			print("✅ 已导入 VS Build Tools 编译环境(INCLUDE/LIB/LIBPATH)。")
-		else:
-			print("⚠️ 未能导入 VS Build Tools 编译环境，torch.compile 可能回退。")
+		model.encoder.to(memory_format=torch.channels_last)
+	# 决定是否使用 torch.compile：优先由环境变量 `TORCH_COMPILE` 控制（'1' 或 '0'），
 	compile_fn = getattr(torch, "compile", None)
+	env_choice = os.environ.get("TORCH_COMPILE", None)
 	cl_path = ensure_msvc_cl_on_path() if os.name == "nt" else ""
-	can_compile = (compile_fn is not None) and (os.name != "nt" or bool(cl_path))
-	if compile_fn is not None and os.name == "nt" and not cl_path:
-		print("⚠️ 检测到未安装 MSVC cl.exe，已禁用 torch.compile 以避免 Inductor 运行时崩溃。")
-	if compile_fn is not None and os.name == "nt" and cl_path:
-		print(f"✅ 已检测到 MSVC 编译器: {cl_path}")
-	if can_compile:
+
+	def _is_compiler_available_on_linux() -> bool:
+		# 在 Linux/Ubuntu 上，检查 gcc 或 clang 是否可用，若存在则认为本地编译工具链可用
+		return bool(shutil.which("gcc") or shutil.which("clang"))
+
+	if env_choice is not None:
+		use_compile = env_choice.strip() in ("1", "true", "yes", "on")
+	else:
 		if compile_fn is None:
-			raise RuntimeError("内部错误: can_compile=True 但 torch.compile 不可用")
-		print("⚡ 开启 torch.compile(dynamic=True) 进行底层算子融合...")
-		# 允许 Dynamo 在后续动态 shape 重编译失败时自动回退 eager，避免中途训练中断。
+			use_compile = False
+		else:
+			if os.name == "nt":
+				use_compile = bool(cl_path)
+			else:
+				use_compile = _is_compiler_available_on_linux()
+
+	if compile_fn is None:
+		use_compile = False
+
+	if use_compile:
+		print("⚡ 使用 torch.compile(dynamic=True) 优化模型（可通过环境变量 TORCH_COMPILE=0 关闭）")
 		torch._dynamo.config.suppress_errors = True
 		compiled_model = cast(LatexOCRModel, compile_fn(model, dynamic=True))
 		try:
@@ -1297,6 +1310,11 @@ def main() -> None:
 
 		if (not args.skip_eval) and eval_loader is not None and (epoch % max(1, args.eval_interval) == 0):
 			set_backbone_grad_checkpointing(eval_model, bool(args.eval_use_gradient_checkpointing))
+			
+			# =========== 新增：在开始验证前强制清空显存碎片 ===========
+			if torch.cuda.is_available():
+				torch.cuda.empty_cache()
+
 			try:
 				eval_em, error_counter, eval_stats = evaluate_epoch(
 					model=eval_model,

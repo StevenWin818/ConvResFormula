@@ -1,16 +1,16 @@
 data:
   train_h5:
-    - C:/Projects/LatexProject/ConvResFormula/datasets/train.h5 # 手写训练集
-    - C:/Projects/LatexProject/ConvResFormula/datasets/synthetic.h5 # 合成训练集
-    - C:/Projects/LatexProject/ConvResFormula/datasets/symbols.h5 # 单字符训练集
-    - C:/Projects/LatexProject/ConvResFormula/datasets/wiki_train_314k.h5 # wiki训练集
-  eval_h5: C:/Projects/LatexProject/ConvResFormula/datasets/val.h5 # 验证/评估集
-  tokenizer: C:/Projects/LatexProject/ConvResFormula/tokenizer_bpe.json # BPE 分词器
+    - datasets/train.h5 # 手写训练集
+    - datasets/synthetic.h5 # 合成训练集
+    - datasets/symbols.h5 # 单字符训练集
+    - datasets/wiki_train_314k.h5 # wiki训练集
+  eval_h5: datasets/val.h5 # 验证/评估集
+  tokenizer: tokenizer_bpe.json # BPE 分词器
   max_area: 120000 # 图像动态缩放的面积上限
 
 training:
   batch_size: 32 # 训练 batch 大小
-  num_workers: 4 # 训练 DataLoader 线程数
+  num_workers: 2 # 训练 DataLoader 线程数
   epochs: 65 # 总训练轮数
   seed: 42 # 随机种子
   mix_ratio: [4, 4, 1,1] # 多数据源采样比例，真实手写:合成手写:单字符手写:wiki
@@ -19,7 +19,7 @@ training:
   decoder_input_noise_ratio: 0.08 # 解码器输入随机 Token 替换概率（缓解曝光偏差）
 
 optimization:
-  encoder_lr: 2.0e-5 # 编码器主干网络学习率
+  encoder_lr: 3.0e-5 # 编码器主干网络学习率
   fpn_lr: 1.5e-4 # FPN层与新增视觉自注意力层的学习率
   decoder_lr: 8.0e-6 # 解码器学习率
   weight_decay: 1.0e-2 # AdamW 权重衰减
@@ -69,7 +69,7 @@ logging:
 
 eval:
   eval_interval: 1 # 每隔多少个 epoch 评估一次
-  batch_size: 32 # 评估 batch 大小
+  batch_size: 24 # 评估 batch 大小
   num_workers: 2 # 评估 DataLoader 线程数
   samples: 1024 # 每轮评估抽样数量，<=0 表示全量
   max_len: 160 # 评估解码最大长度
@@ -80,12 +80,12 @@ eval:
 runtime:
   ckpt_dir: checkpoints/ar # checkpoint 输出目录
   log_dir: logs/ar_logs # 日志输出目录
-  resume_ckpt: checkpoints\ar\epoch_48.pth # 恢复训练使用的 checkpoint
+  resume_ckpt: checkpoints/ar/epoch_51.pth # 恢复训练使用的 checkpoint
   resume: True # 是否默认启用断点恢复
   reset_lr: False # 是否在恢复断点时重置学习率和优化器状态（用于触发 Warm Restarts）
   amp_dtype: fp16 # 训练精度类型(fp16/bf16/fp32)
   cudnn_benchmark: True # 启用 cudnn benchmark 模式以优化卷积性能
-  channels_last: False # 启用 channels_last 内存格式
+  channels_last: True # 启用 channels_last 内存格式
   kernel_warmup_batches: 0 # 训练前预热批次数，过大可能显著拉长首轮启动
 
 cli_help:

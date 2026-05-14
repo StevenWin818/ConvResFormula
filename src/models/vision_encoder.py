@@ -9,6 +9,7 @@ from typing import Any, Callable, Optional, Tuple, Union, cast
 import torch
 import torch.nn as nn
 import timm
+import re
 
 class PositionalEncoding2D(nn.Module):
     """
@@ -51,6 +52,42 @@ class PositionalEncoding2D(nn.Module):
         _, _, h, w = x.size()
         # 截取当前实际特征图大小的 PE，并加上去
         return x + self.pe[:, :h, :w].unsqueeze(0)
+
+
+class RelativePositionBias2D(nn.Module):
+    def __init__(self, num_heads, max_h=64, max_w=256):
+        """
+        二维相对位置偏置矩阵。
+        max_h 和 max_w 需覆盖 Stride 16 下特征图的最大尺寸。
+        """
+        super().__init__()
+        self.num_heads = num_heads
+        self.max_h = max_h
+        self.max_w = max_w
+        self.bias_table = nn.Parameter(torch.zeros((2 * max_h - 1) * (2 * max_w - 1), num_heads))
+        nn.init.trunc_normal_(self.bias_table, std=0.02)
+
+    def forward(self, h, w, batch_size, device):
+        # 计算相对坐标索引
+        y = torch.arange(h, device=device)
+        x = torch.arange(w, device=device)
+        y_idx = (y.view(-1, 1) - y.view(1, -1)) + self.max_h - 1
+        x_idx = (x.view(-1, 1) - x.view(1, -1)) + self.max_w - 1
+        
+        # 组合为一维索引: [H, H, W, W] -> [H, W, H, W] -> [H*W, H*W]
+        idx = y_idx.view(h, h, 1, 1) * (2 * self.max_w - 1) + x_idx.view(1, 1, w, w)
+        idx = idx.permute(0, 2, 1, 3).contiguous().view(h * w, h * w)
+
+        max_valid_idx = (2 * self.max_h - 1) * (2 * self.max_w - 1) - 1
+        idx = torch.clamp(idx, 0, max_valid_idx)
+
+        # 提取偏置并调整维度: [H*W, H*W, num_heads] -> [num_heads, L, L]
+        bias = self.bias_table[idx]
+        bias = 8.0 * torch.tanh(bias / 8.0)
+        bias = bias.permute(2, 0, 1).contiguous()
+
+        # 适配 PyTorch MultiheadAttention 的 src_mask 形状要求: [B * num_heads, L, L]
+        return bias.unsqueeze(0).repeat(batch_size, 1, 1, 1).view(batch_size * self.num_heads, h * w, h * w)
 
 
 class ConvNeXtV2Encoder(nn.Module):
@@ -119,9 +156,15 @@ class ConvNeXtV2Encoder(nn.Module):
             batch_first=True,
             norm_first=True
         )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=2)
+        self.transformer_encoder = nn.TransformerEncoder(
+            encoder_layer, 
+            num_layers=2,
+            enable_nested_tensor=False)
+        
+        # 5. 二维相对位置偏置 (Relative Position Bias)
+        self.rel_pos_bias = RelativePositionBias2D(num_heads=8)
 
-        # 4. BoW 辅助头
+        # 6. BoW 辅助头
         self.bow_head = nn.Linear(d_model, int(ctc_vocab_size))
 
     def forward(
@@ -175,7 +218,7 @@ class ConvNeXtV2Encoder(nn.Module):
         # 6. Visual DropToken (随机丢弃视觉序列，强制全局注意力)
         if self.training:
             # 以 12% 的概率丢弃 (keep_mask 为 True 表示保留)
-            keep_mask = torch.rand(sigreg_embedding.shape[:2], device=sigreg_embedding.device) > 0.12
+            keep_mask = torch.rand(sigreg_embedding.shape[:2], device=sigreg_embedding.device) > 0.05
             # 缩放以保持期望值
             sigreg_embedding = (sigreg_embedding * keep_mask.unsqueeze(-1)) / 0.88
             
@@ -183,8 +226,22 @@ class ConvNeXtV2Encoder(nn.Module):
             # memory_padding_mask 中 True 表示无效位置
             memory_padding_mask = memory_padding_mask | (~keep_mask)
 
-        # 7. 视觉自注意力层 (建立高分辨率视觉 Token 的全局上下文)
-        sigreg_embedding = self.transformer_encoder(sigreg_embedding, src_key_padding_mask=memory_padding_mask)
+        # 7. 生成 2D 相对位置偏置
+        attn_bias = self.rel_pos_bias(h_feat, w_feat, b_f, features.device)
+
+        float_padding_mask = torch.zeros(
+            memory_padding_mask.shape, 
+            dtype=attn_bias.dtype, 
+            device=memory_padding_mask.device
+        )
+        float_padding_mask.masked_fill_(memory_padding_mask, float('-inf'))
+
+        # 8. 视觉自注意力层 (建立高分辨率视觉 Token 的全局上下文，同时注入相对位置先验)
+        sigreg_embedding = self.transformer_encoder(
+            sigreg_embedding, 
+            mask=attn_bias,
+            src_key_padding_mask=float_padding_mask
+        )
         
         # 【核心修复 2】将 BoW 监督信号移动到 Transformer 之后，并修复平均池化
         bow_logits = None

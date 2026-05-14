@@ -599,14 +599,14 @@ def check_visual_equivalence(gt_tex: str, pred_tex: str, svg_renderer: NodeKatex
 
 def parse_args() -> argparse.Namespace:
 	parser = argparse.ArgumentParser(description="AR 解码评估脚本（SVG DOM 严格一致性）")
-	parser.add_argument("--eval_h5", type=str, default=r"C:\Projects\LatexProject\ConvResFormula\datasets\val.h5")
-	parser.add_argument("--tokenizer", type=str, default=r"C:\Projects\LatexProject\ConvResFormula\tokenizer_bpe.json")
-	parser.add_argument("--checkpoint", type=str, default=r"checkpoints\ar\best.pth")
+	parser.add_argument("--eval_h5", type=str, default=str(PROJECT_ROOT / "datasets" / "val.h5"))
+	parser.add_argument("--tokenizer", type=str, default=str(PROJECT_ROOT / "tokenizer_bpe.json"))
+	parser.add_argument("--checkpoint", type=str, default=str(PROJECT_ROOT / "checkpoints" / "ar" / "best.pth"))
 	parser.add_argument("--train_config", type=str, default=str(PROJECT_ROOT / "configs" / "train_ar.yaml"))
 	parser.add_argument("--model_config", type=str, default=str(PROJECT_ROOT / "configs" / "model_convnext_attnres.yaml"))
 	parser.add_argument("--d_model", type=int, default=256)
 	parser.add_argument("--max_area", type=int, default=98304)
-	parser.add_argument("--batch_size", type=int, default=32)
+	parser.add_argument("--batch_size", type=int, default=24)
 	parser.add_argument("--beam_size", type=int, default=1, help="Beam Search 大小，默认 1 为贪心解码")
 	parser.add_argument("--num_workers", type=int, default=4)
 	parser.add_argument("--max_len", type=int, default=160)
@@ -622,7 +622,7 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--checkpoint_decoder_layers", dest="checkpoint_decoder_layers", action="store_true", help="启用解码器层梯度检查点")
 	parser.add_argument("--no_checkpoint_decoder", dest="checkpoint_decoder_layers", action="store_false", help="禁用解码器层梯度检查点")
 	parser.set_defaults(checkpoint_decoder_layers=None)
-	parser.add_argument("--report_dir", type=str, default=r"logs\ar_logs")
+	parser.add_argument("--report_dir", type=str, default=str(PROJECT_ROOT / "logs" / "ar_logs"))
 	parser.add_argument("--log_interval", type=int, default=100)
 	parser.add_argument(
 		"--svg_node_script",
@@ -714,6 +714,39 @@ def collate_eval_batch(batch, pad_token_id: int) -> Dict[str, torch.Tensor]:
 	return {"images": batched_images, "target_ids": target_ids}
 
 
+def get_syntax_imbalance_penalty(text: str) -> int:
+    """计算文本中 LaTeX 致命结构失衡的数量"""
+    # 1. 过滤掉被转义的括号，它们不参与结构
+    text = text.replace(r'\{', '').replace(r'\}', '')
+    
+    imbalance = 0
+    
+    # 2. 大括号栈匹配
+    depth = 0
+    for char in text:
+        if char == '{':
+            depth += 1
+        elif char == '}':
+            if depth > 0:
+                depth -= 1
+            else:
+                imbalance += 1
+    imbalance += depth
+    
+    # 3. 精确匹配 \left 和 \right，避免误伤 \rightarrow
+    # (?![a-zA-Z]) 确保后面没有其他字母，即匹配精确的命令边界
+    left_count = len(re.findall(r'\\left(?![a-zA-Z])', text))
+    right_count = len(re.findall(r'\\right(?![a-zA-Z])', text))
+    imbalance += abs(left_count - right_count)
+    
+    # 4. 精确匹配 \begin 和 \end 
+    begin_count = len(re.findall(r'\\begin(?![a-zA-Z])', text))
+    end_count = len(re.findall(r'\\end(?![a-zA-Z])', text))
+    imbalance += abs(begin_count - end_count)
+    
+    return imbalance
+
+
 @torch.no_grad()
 def batched_infer_ar(
 	model: LatexOCRModel,
@@ -725,6 +758,7 @@ def batched_infer_ar(
 	amp_enabled: bool,
 	amp_dtype: torch.dtype,
 	beam_size: int = 1,
+	tokenizer: Optional[Tokenizer] = None,
 ) -> List[List[int]]:
 	"""批量版 AR 解码，支持贪心与束搜索 (Beam Search)。"""
 	batch_size = images.size(0)
@@ -845,10 +879,32 @@ def batched_infer_ar(
 	lengths = (generated != pad_id).sum(dim=2).float()
 
 	# 2. 在终点线进行全局长度惩罚
-	alpha = 0.8
+	alpha = 2
 	# 注意：因为分数是负数，除以一个大于 1 的长度因子，反而会让长句子的负分变小
 	# 但 PyTorch 中的 Log-Prob 通常直接除以长度。如果你发现模型过于偏向超长乱码，可以调整 alpha 为 0.6 甚至 0.5
 	penalized_scores = beam_scores / (lengths ** alpha)
+
+		# ==========================================
+	# 🌟 新增：基于 Beam Search 序列解码的语法惩罚
+	# ==========================================
+	if beam_size > 1 and tokenizer is not None:
+		for b in range(batch_size):
+			for k in range(beam_size):
+				# 提取当前候选序列
+				seq = generated[b, k].tolist()
+				if eos_id in seq:
+					seq = seq[:seq.index(eos_id)]
+				
+				# 解码出对应的文本
+				candidate_text = tokenizer.decode(seq, skip_special_tokens=True)
+				
+				# 获取失衡分数
+				imbalance_score = get_syntax_imbalance_penalty(candidate_text)
+				
+				# 施加极重的惩罚 (例如每个失衡点扣除 10.0 的 logit 概率)
+				if imbalance_score > 0:
+					penalized_scores[b, k] -= imbalance_score * 10.0
+	# ==========================================
 
 	# 3. 找出惩罚后，性价比最高的那一条束 (Beam)
 	best_indices = penalized_scores.argmax(dim=1)  # [batch_size]
@@ -908,8 +964,29 @@ def build_model(
 	if incompatible.unexpected_keys:
 		print(f"警告(Eval): 多余 {len(incompatible.unexpected_keys)} 个参数。")
 	model.eval()
-	if enable_compile and hasattr(torch, "compile"):
-		model = cast(LatexOCRModel, torch.compile(model, dynamic=True))
+
+	# 决定是否使用 torch.compile：环境变量 TORCH_COMPILE 优先（'1'/'true' 启用），否则依据 enable_compile
+	env_choice = os.environ.get("TORCH_COMPILE", None)
+
+	def _is_compiler_available_on_linux() -> bool:
+		return bool(shutil.which("gcc") or shutil.which("clang"))
+
+	use_compile: bool
+	if env_choice is not None:
+		use_compile = env_choice.strip().lower() in ("1", "true", "yes", "on")
+	else:
+		use_compile = bool(enable_compile)
+
+	if use_compile and hasattr(torch, "compile"):
+		# 在 Windows 上建议检查 cl.exe 是否存在；在 Linux 上检查 gcc/clang
+		if os.name == "nt":
+			cl_path = shutil.which("cl")
+			if cl_path:
+				model = cast(LatexOCRModel, torch.compile(model, dynamic=True))
+		else:
+			if _is_compiler_available_on_linux():
+				model = cast(LatexOCRModel, torch.compile(model, dynamic=True))
+
 	return model
 
 
@@ -1015,6 +1092,7 @@ def evaluate(args: argparse.Namespace) -> Tuple[float, float, int]:
 				amp_enabled=amp_enabled,
 				amp_dtype=eval_amp_dtype,
 				beam_size=args.beam_size,
+				tokenizer=tokenizer,
 			)
 
 			for i in range(len(pred_batch)):

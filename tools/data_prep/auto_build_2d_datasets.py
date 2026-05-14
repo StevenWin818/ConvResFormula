@@ -237,30 +237,32 @@ def build_dataset(name: str, source_h5: str, target_h5: str, tokenizer: Tokenize
         print(f"· {name} 构建成功！有效样本数: {valid_count} / {total_samples}")
 
 if __name__ == "__main__":
-    # === 1. 载入 BPE Tokenizer ===
-    TOKENIZER_PATH = r"C:\Projects\LatexProject\ConvResFormula\tokenizer_bpe.json"
+    # === 1. 项目根与 BPE Tokenizer（ConvResFormula 下的资源改为相对路径） ===
+    PROJECT_ROOT = Path(__file__).resolve().parents[2]
+    TOKENIZER_PATH = str(PROJECT_ROOT / "tokenizer_bpe.json")
     print(f"· 正在加载 BPE Tokenizer: {TOKENIZER_PATH}")
     tokenizer = Tokenizer.from_file(TOKENIZER_PATH)
 
     DEFAULT_TARGET_H = 128
 
     # === 2. 配置数据集  ===
+    # 注意：源数据集（外部 datasets）保持原始路径不变；ConvResFormula 下的目标路径改为仓库相对路径
     DATASETS_TO_BUILD = [
         ("手写训练集 (Train)", 
          r"C:\Projects\LatexProject\datasets\train.h5", 
-         r"C:\Projects\LatexProject\ConvResFormula\datasets\train.h5", DEFAULT_TARGET_H),
+         str(PROJECT_ROOT / "datasets" / "train.h5"), DEFAULT_TARGET_H),
          
         ("手写验证集 (Val)", 
          r"C:\Projects\LatexProject\datasets\val.h5", 
-         r"C:\Projects\LatexProject\ConvResFormula\datasets\val.h5", DEFAULT_TARGET_H),
+         str(PROJECT_ROOT / "datasets" / "val.h5"), DEFAULT_TARGET_H),
          
         ("合成长公式 (Synthetic)", 
          r"C:\Projects\LatexProject\datasets\synthetic.h5", 
-         r"C:\Projects\LatexProject\ConvResFormula\datasets\synthetic.h5", DEFAULT_TARGET_H),
+         str(PROJECT_ROOT / "datasets" / "synthetic.h5"), DEFAULT_TARGET_H),
          
         ("单字符集 (Symbols)", 
          r"C:\Projects\LatexProject\datasets\symbols.h5", 
-         r"C:\Projects\LatexProject\ConvResFormula\datasets\symbols.h5", DEFAULT_TARGET_H),
+         str(PROJECT_ROOT / "datasets" / "symbols.h5"), DEFAULT_TARGET_H),
     ]
 
     for name, src, dst, target_h in DATASETS_TO_BUILD:
