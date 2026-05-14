@@ -10,7 +10,7 @@ from collections import Counter
 from datetime import datetime
 from functools import partial
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple, cast
+from typing import Any, Dict, List, Optional, Sequence, Tuple, cast
 
 import numpy as np
 import torch
@@ -43,6 +43,7 @@ from src.engine.lr_schedulers import build_linear_warmup_cosine_scheduler, infer
 from src.engine.trainer import ARTrainer
 from src.models.latex_ocr_model import LatexOCRModel
 from src.models.text_decoder import convert_legacy_attnres_state_dict
+from scripts.eval import NodeKatexSvgRenderer, check_visual_equivalence
 
 torch._inductor.config.fallback_random = True
 logging.getLogger("torch._inductor").setLevel(logging.ERROR)
@@ -113,6 +114,12 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--eval_samples", type=int, default=None, help=h("eval_samples", "每轮评估抽样数量，<=0 表示全量"))
 	parser.add_argument("--eval_max_len", type=int, default=None, help=h("eval_max_len", "评估解码最大长度"))
 	parser.add_argument("--eval_amp_dtype", type=str, choices=["fp16", "bf16", "fp32"], default=None, help="评估精度类型: fp16 / bf16 / fp32")
+	parser.add_argument(
+		"--svg_node_script",
+		type=str,
+		default=str(PROJECT_ROOT / "tools" / "debug" / "katex_svg_renderer.js"),
+		help="Node SVG 渲染脚本路径",
+	)
 	parser.add_argument("--eval_use_gradient_checkpointing", dest="eval_use_gradient_checkpointing", action="store_true", help="评估阶段启用视觉梯度检查点")
 	parser.add_argument("--eval_no_gradient_checkpointing", dest="eval_use_gradient_checkpointing", action="store_false", help="评估阶段禁用视觉梯度检查点")
 	parser.set_defaults(eval_use_gradient_checkpointing=None)
@@ -819,6 +826,7 @@ def evaluate_epoch(
 	eos_id: int,
 	num_samples: int,
 	max_len: int,
+	svg_renderer: Optional[NodeKatexSvgRenderer] = None,
 ) -> Tuple[float, Counter[str], Dict[str, float]]:
 	"""参考 train_2d_phase2 的评估流程：按 epoch 抽样评估 + Top 错误统计。"""
 	model.eval()
@@ -859,7 +867,12 @@ def evaluate_epoch(
 			dist = levenshtein_distance(pred_text, gt_text)
 			ned = dist / max(1, len(gt_text))
 
-			exact += int(pred_text == gt_text)
+			if svg_renderer is not None:
+				is_correct = check_visual_equivalence(gt_text, pred_text, svg_renderer)
+			else:
+				is_correct = (pred_text == gt_text)
+
+			exact += int(is_correct)
 			total_ned += ned
 			processed += 1
 
@@ -1298,9 +1311,23 @@ def main() -> None:
 	if warmed > 0:
 		print(f"内核预热完成: {warmed} batches")
 
+	# Initialize SVG Renderer for EvalRenderEM
+	svg_node_script = args.svg_node_script
+	if not os.path.isabs(svg_node_script):
+		svg_node_script = str((PROJECT_ROOT / svg_node_script).resolve())
+	svg_renderer = NodeKatexSvgRenderer(node_script=svg_node_script)
+	if not svg_renderer._start_process():
+		print("警告: 无法启动 SVG 渲染子进程。评估将降级为文本严格匹配 (EvalTextEM)。")
+		svg_renderer = None
+
 	for epoch in range(start_epoch, args.epochs + 1):
 		train_batch_sampler.set_epoch(epoch)
 		avg_loss, avg_ce, avg_bow, avg_sigreg, avg_acc = trainer.train_epoch(train_loader, epoch=epoch, log_interval=args.log_interval)
+
+		# --- [修改点] 先保存模型，再运行评估 ---
+		is_best_loss = avg_loss <= best_loss
+		if is_best_loss:
+			best_loss = avg_loss
 
 		eval_processed = 0.0
 		eval_exact = 0.0
@@ -1308,10 +1335,40 @@ def main() -> None:
 		eval_ned = 1.0
 		error_counter: Counter[str] = Counter()
 
+		# 构造基础 payload (此时 eval 还没跑，仅落地模型权重)
+		ckpt_payload: Dict[str, object] = {
+			"epoch": epoch,
+			"model": eval_model_for_ckpt.state_dict(),
+			"model_raw": model.state_dict(),
+			"optimizer": optimizer.state_dict(),
+			"scheduler": scheduler.state_dict(),
+			"best_loss": best_loss,
+			"best_em": best_em,
+			"latest_em": eval_em,
+			"eval_processed": int(eval_processed),
+			"eval_exact": int(eval_exact),
+			"eval_ned": float(eval_ned),
+			"config": vars(args),
+		}
+		if scaler is not None:
+			ckpt_payload["scaler"] = scaler.state_dict()
+
+		latest_ckpt = os.path.join(args.ckpt_dir, "latest.pth")
+		epoch_ckpt = os.path.join(args.ckpt_dir, f"epoch_{epoch}.pth")
+		best_loss_ckpt = os.path.join(args.ckpt_dir, "best_loss.pth")
+
+		# 立即落地权重，防止评估崩溃导致本轮训练成果丢失
+		torch.save(ckpt_payload, latest_ckpt)
+		torch.save(ckpt_payload, epoch_ckpt)
+		if is_best_loss:
+			torch.save(ckpt_payload, best_loss_ckpt)
+			print(f"更新最小训练损失: {best_loss:.4f}")
+		print(f"Epoch {epoch} 模型权重已保存至 {latest_ckpt}")
+
+		# --- 执行评估 ---
 		if (not args.skip_eval) and eval_loader is not None and (epoch % max(1, args.eval_interval) == 0):
 			set_backbone_grad_checkpointing(eval_model, bool(args.eval_use_gradient_checkpointing))
 			
-			# =========== 新增：在开始验证前强制清空显存碎片 ===========
 			if torch.cuda.is_available():
 				torch.cuda.empty_cache()
 
@@ -1329,13 +1386,32 @@ def main() -> None:
 					eos_id=eos_id,
 					num_samples=args.eval_samples,
 					max_len=args.eval_max_len,
+					svg_renderer=svg_renderer,
 				)
+				eval_processed = eval_stats["processed"]
+				eval_exact = eval_stats["exact"]
+				eval_ned = eval_stats["avg_ned"]
 			finally:
 				set_backbone_grad_checkpointing(eval_model, bool(args.use_gradient_checkpointing))
-			eval_processed = eval_stats["processed"]
-			eval_exact = eval_stats["exact"]
-			eval_ned = eval_stats["avg_ned"]
+			
+			# 评估完成后，更新 payload 中的指标并重新保存最新的 checkpoint (使其包含本轮指标)
+			ckpt_payload["latest_em"] = eval_em
+			ckpt_payload["eval_processed"] = int(eval_processed)
+			ckpt_payload["eval_exact"] = int(eval_exact)
+			ckpt_payload["eval_ned"] = float(eval_ned)
+			torch.save(ckpt_payload, latest_ckpt)
+			torch.save(ckpt_payload, epoch_ckpt)
 
+			is_best_em = eval_em >= best_em
+			if is_best_em:
+				best_em = eval_em
+				ckpt_payload["best_em"] = best_em
+				
+				best_ckpt = os.path.join(args.ckpt_dir, "best.pth")
+				torch.save(ckpt_payload, best_ckpt)
+				print(f"更新 best checkpoint: {best_ckpt} | best_em={best_em * 100:.2f}%")
+
+		# --- 日志与打印 ---
 		lr_enc = float(optimizer.param_groups[0]["lr"])
 		lr_dec = float(optimizer.param_groups[1]["lr"])
 
@@ -1354,57 +1430,18 @@ def main() -> None:
 				f"{lr_enc:.8e}\t{lr_dec:.8e}\n"
 			)
 
-		is_best_em = eval_em >= best_em
-		is_best_loss = avg_loss <= best_loss
-		if is_best_em:
-			best_em = eval_em
-		if is_best_loss:
-			best_loss = avg_loss
-
-		ckpt_payload: Dict[str, object] = {
-			"epoch": epoch,
-			"model": eval_model_for_ckpt.state_dict(),
-			"model_raw": model.state_dict(),
-			# "ema_model": ema_model.state_dict() if ema_model is not None else None,
-			"optimizer": optimizer.state_dict(),
-			"scheduler": scheduler.state_dict(),
-			"best_loss": best_loss,
-			"best_em": best_em,
-			"latest_em": eval_em,
-			"eval_processed": int(eval_processed),
-			"eval_exact": int(eval_exact),
-			"eval_ned": float(eval_ned),
-			"config": vars(args),
-		}
-		if scaler is not None:
-			ckpt_payload["scaler"] = scaler.state_dict()
-
-		latest_ckpt = os.path.join(args.ckpt_dir, "latest.pth")
-		epoch_ckpt = os.path.join(args.ckpt_dir, f"epoch_{epoch}.pth")
-		best_ckpt = os.path.join(args.ckpt_dir, "best.pth")
-		best_loss_ckpt = os.path.join(args.ckpt_dir, "best_loss.pth")
-
-		torch.save(ckpt_payload, latest_ckpt)
-		torch.save(ckpt_payload, epoch_ckpt)
-
 		if error_counter:
 			err_path = os.path.join(args.log_dir, f"ar_epoch_{epoch}_top_errors.txt")
 			with open(err_path, "w", encoding="utf-8") as ef:
 				for key, count in error_counter.most_common(20):
 					ef.write(f"[{count:5d}] {key}\n")
 
-		if is_best_em:
-			torch.save(ckpt_payload, best_ckpt)
-			print(f"更新 best checkpoint: {best_ckpt} | best_em={best_em * 100:.2f}%")
-
-		if is_best_loss:
-			torch.save(ckpt_payload, best_loss_ckpt)
-			print(f"更新最小训练损失: {best_loss:.4f}")
-
 		# 强制清空显存碎片，为下一个 Epoch 准备更连续的可用显存
 		if torch.cuda.is_available():
 			torch.cuda.empty_cache()
 		print(f"Epoch {epoch} 结束，准备进入下一轮...")
+	if svg_renderer is not None:
+		svg_renderer.close()
 
 	print("\nAR 训练完成。")
 
