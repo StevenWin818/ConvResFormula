@@ -282,6 +282,10 @@ class ARTrainer:
         
         pbar = tqdm(dataloader, desc=f"Epoch {epoch} [Train]")
         for batch_idx, batch in enumerate(pbar):
+            if getattr(self, "request_stop", False):
+                tqdm.write("\n[WARNING] Received stop request (SIGTERM). Breaking epoch loop...")
+                break
+
             images = batch["images"].to(self.device, non_blocking=True)
             if self.channels_last and images.ndim == 4:
                 images = images.contiguous(memory_format=torch.channels_last)
@@ -325,4 +329,5 @@ class ARTrainer:
         avg_bow = total_bow / valid_batches if valid_batches > 0 else 0.0
         avg_sigreg = total_sigreg / valid_batches if valid_batches > 0 else 0.0
         avg_acc = total_acc / valid_batches if valid_batches > 0 else 0.0
-        return avg_loss, avg_ce, avg_bow, avg_sigreg, avg_acc
+        interrupted = getattr(self, "request_stop", False)
+        return avg_loss, avg_ce, avg_bow, avg_sigreg, avg_acc, interrupted

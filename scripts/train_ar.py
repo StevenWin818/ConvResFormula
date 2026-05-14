@@ -6,6 +6,7 @@ import random
 import shutil
 import subprocess
 import sys
+import signal
 from collections import Counter
 from datetime import datetime
 from functools import partial
@@ -962,6 +963,10 @@ def main() -> None:
 	# benchmark=True 时关闭 deterministic 以释放 cudnn 算法选择性能。
 	torch.backends.cudnn.deterministic = not bool(args.cudnn_benchmark)
 
+	# 配置 torch.compile 缓存目录，防止 Spot VM 抢占后缓存丢失
+	if args.ckpt_dir:
+		os.environ["TORCHINDUCTOR_CACHE_DIR"] = os.path.join(args.ckpt_dir, ".inductor_cache")
+
 	os.makedirs(args.ckpt_dir, exist_ok=True)
 	os.makedirs(args.log_dir, exist_ok=True)
 	log_path = os.path.join(args.log_dir, "train_ar.log")
@@ -1265,6 +1270,12 @@ def main() -> None:
 		decoder_input_noise_ratio=float(args.decoder_input_noise_ratio),
 	)
 
+	def sigterm_handler(signum, frame):
+		print("\n[WARNING] 捕获到 SIGTERM 信号 (GCP Preemption)！准备保存断点并退出...", flush=True)
+		trainer.request_stop = True
+
+	signal.signal(signal.SIGTERM, sigterm_handler)
+
 	if not os.path.exists(log_path):
 		with open(log_path, "w", encoding="utf-8") as f:
 			f.write("Timestamp\tEpoch\tLoss\tCE\tBoW\tSIGReg\tTokenAcc(%)\tEvalProcessed\tEvalExact\tEvalEM(%)\tEvalNED\tLREnc\tLRDec\n")
@@ -1322,7 +1333,7 @@ def main() -> None:
 
 	for epoch in range(start_epoch, args.epochs + 1):
 		train_batch_sampler.set_epoch(epoch)
-		avg_loss, avg_ce, avg_bow, avg_sigreg, avg_acc = trainer.train_epoch(train_loader, epoch=epoch, log_interval=args.log_interval)
+		avg_loss, avg_ce, avg_bow, avg_sigreg, avg_acc, interrupted = trainer.train_epoch(train_loader, epoch=epoch, log_interval=args.log_interval)
 
 		# --- [修改点] 先保存模型，再运行评估 ---
 		is_best_loss = avg_loss <= best_loss
@@ -1337,7 +1348,7 @@ def main() -> None:
 
 		# 构造基础 payload (此时 eval 还没跑，仅落地模型权重)
 		ckpt_payload: Dict[str, object] = {
-			"epoch": epoch,
+			"epoch": epoch - 1 if interrupted else epoch,
 			"model": eval_model_for_ckpt.state_dict(),
 			"model_raw": model.state_dict(),
 			"optimizer": optimizer.state_dict(),
@@ -1364,6 +1375,10 @@ def main() -> None:
 			torch.save(ckpt_payload, best_loss_ckpt)
 			print(f"更新最小训练损失: {best_loss:.4f}")
 		print(f"Epoch {epoch} 模型权重已保存至 {latest_ckpt}")
+
+		if interrupted:
+			print(f"\n[INFO] 训练因抢占被终止，已保存断点。下次将从 Epoch {epoch} 重新开始。")
+			sys.exit(0)
 
 		# --- 执行评估 ---
 		if (not args.skip_eval) and eval_loader is not None and (epoch % max(1, args.eval_interval) == 0):

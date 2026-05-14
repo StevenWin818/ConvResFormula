@@ -1,5 +1,5 @@
 model:
-  d_model: 256
+  d_model: 512
   use_learned_position_embeddings: true # 使用可学习的位置编码（相对于固定正弦位置编码更适合长序列）
   max_position_embeddings: 2048
   use_gradient_checkpointing: true # 启用梯度检查点以降低显存占用（会增加计算时间）
@@ -7,7 +7,7 @@ model:
   checkpoint_decoder_layers: false # 是否对解码器层应用检查点
 
 vision_encoder:
-  model_name: convnextv2_nano
+  model_name: convnextv2_tiny
   pretrained: true
   in_chans: 1
   drop_path_rate: 0.08

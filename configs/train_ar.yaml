@@ -10,7 +10,7 @@ data:
 
 training:
   batch_size: 32 # 训练 batch 大小
-  num_workers: 2 # 训练 DataLoader 线程数
+  num_workers: 4 # 训练 DataLoader 线程数
   epochs: 65 # 总训练轮数
   seed: 42 # 随机种子
   mix_ratio: [4, 4, 1,1] # 多数据源采样比例，真实手写:合成手写:单字符手写:wiki
@@ -70,7 +70,7 @@ logging:
 eval:
   eval_interval: 1 # 每隔多少个 epoch 评估一次
   batch_size: 24 # 评估 batch 大小
-  num_workers: 2 # 评估 DataLoader 线程数
+  num_workers: 8 # 评估 DataLoader 线程数
   samples: 1024 # 每轮评估抽样数量，<=0 表示全量
   max_len: 160 # 评估解码最大长度
   amp_dtype: bf16 # 评估精度类型(fp16/bf16/fp32)
@@ -83,8 +83,8 @@ runtime:
   resume_ckpt: checkpoints/ar/epoch_51.pth # 恢复训练使用的 checkpoint
   resume: True # 是否默认启用断点恢复
   reset_lr: False # 是否在恢复断点时重置学习率和优化器状态（用于触发 Warm Restarts）
-  amp_dtype: fp16 # 训练精度类型(fp16/bf16/fp32)
-  cudnn_benchmark: True # 启用 cudnn benchmark 模式以优化卷积性能
+  amp_dtype: bf16 # 训练精度类型(fp16/bf16/fp32)
+  cudnn_benchmark: False # 禁用 cudnn benchmark，避免动态输入 shape 导致的重编译开销
   channels_last: True # 启用 channels_last 内存格式
   kernel_warmup_batches: 0 # 训练前预热批次数，过大可能显著拉长首轮启动
 
