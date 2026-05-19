@@ -218,9 +218,9 @@ class ConvNeXtV2Encoder(nn.Module):
         # 6. Visual DropToken (随机丢弃视觉序列，强制全局注意力)
         if self.training:
             # 以 12% 的概率丢弃 (keep_mask 为 True 表示保留)
-            keep_mask = torch.rand(sigreg_embedding.shape[:2], device=sigreg_embedding.device) > 0.05
+            keep_mask = torch.rand(sigreg_embedding.shape[:2], device=sigreg_embedding.device) > 0.1
             # 缩放以保持期望值
-            sigreg_embedding = (sigreg_embedding * keep_mask.unsqueeze(-1)) / 0.88
+            sigreg_embedding = (sigreg_embedding * keep_mask.unsqueeze(-1)) / 0.9
             
             # 【核心修复 1】将丢弃的 Token 同步到掩码中，防止“幽灵 Token”干扰自注意力
             # memory_padding_mask 中 True 表示无效位置

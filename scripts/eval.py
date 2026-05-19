@@ -635,6 +635,12 @@ def parse_args() -> argparse.Namespace:
 		action="store_true",
 		help="兼容旧参数，当前版本已停用该开关（始终使用本地 Node 依赖）",
 	)
+	parser.add_argument(
+		"--alpha_config",
+		type=str,
+		default="",
+		help="动态 Alpha 参数 JSON 配置文件路径（由 tune_alpha.py 生成）",
+	)
 	return parser.parse_args()
 
 
@@ -759,6 +765,10 @@ def batched_infer_ar(
 	amp_dtype: torch.dtype,
 	beam_size: int = 1,
 	tokenizer: Optional[Tokenizer] = None,
+	alpha_min: float = 0.6,
+	alpha_max: float = 1.8,
+	alpha_short_thresh: float = 5.0,
+	alpha_long_thresh: float = 30.0,
 ) -> List[List[int]]:
 	"""批量版 AR 解码，支持贪心与束搜索 (Beam Search)。"""
 	batch_size = images.size(0)
@@ -878,15 +888,26 @@ def batched_infer_ar(
 	# 1. 计算真实的有效长度 
 	lengths = (generated != pad_id).sum(dim=2).float()
 
-	# 2. 在终点线进行全局长度惩罚
-	alpha = 2
-	# 注意：因为分数是负数，除以一个大于 1 的长度因子，反而会让长句子的负分变小
-	# 但 PyTorch 中的 Log-Prob 通常直接除以长度。如果你发现模型过于偏向超长乱码，可以调整 alpha 为 0.6 甚至 0.5
-	penalized_scores = beam_scores / (lengths ** alpha)
+	# 新增：基于序列长度的动态 Alpha 机制
+	# 设定短公式与长公式的界限，以及对应的惩罚力度
+	min_alpha = 0.8      # 对于极短公式，几乎不给长度奖励，防止模型胡言乱语凑长度
+	max_alpha = 2.0      # 对于超长公式，给予强力补偿，防止长公式提前截断 (过早 EOS)
+	short_thresh = 7.0  # 长度 <= 5 的公式视为极短公式
+	long_thresh = 50.0   # 长度 >= 80 的公式视为超长公式
 
-		# ==========================================
-	# 🌟 新增：基于 Beam Search 序列解码的语法惩罚
-	# ==========================================
+	# 计算当前长度在阈值区间内的线性插值比例 [0.0, 1.0]
+	length_ratio = ((lengths - short_thresh) / (long_thresh - short_thresh)).clamp(min=0.0, max=1.0)
+	
+	# 生成与 lengths 相同形状的动态 alpha 张量 [batch_size, beam_size]
+	dynamic_alpha = min_alpha + length_ratio * (max_alpha - min_alpha)
+
+	# 引入 GNMT 经典的长度平滑因子 (5+L)/(5+1)，对极短序列进一步柔和化处理
+	smoothed_lengths = (5.0 + lengths) / 6.0
+
+	# 2. 施加动态长度惩罚
+	penalized_scores = beam_scores / (smoothed_lengths ** dynamic_alpha)
+
+	# 新增：基于 Beam Search 序列解码的语法惩罚
 	if beam_size > 1 and tokenizer is not None:
 		for b in range(batch_size):
 			for k in range(beam_size):
@@ -1063,6 +1084,19 @@ def evaluate(args: argparse.Namespace) -> Tuple[float, float, int]:
 		mismatch_counter: Counter[str] = Counter()
 		report_rows: List[str] = []
 
+		# 加载可选的 alpha 配置（仅需读取一次）
+		alpha_kwargs: Dict[str, float] = {}
+		if getattr(args, "alpha_config", "") and os.path.exists(args.alpha_config):
+			with open(args.alpha_config, "r", encoding="utf-8") as acf:
+				ac = json.load(acf)
+			alpha_kwargs = {
+				"alpha_min": float(ac.get("alpha_min", 0.6)),
+				"alpha_max": float(ac.get("alpha_max", 1.8)),
+				"alpha_short_thresh": float(ac.get("short_thresh", 5.0)),
+				"alpha_long_thresh": float(ac.get("long_thresh", 30.0)),
+			}
+			print(f"已加载 Alpha 配置: {alpha_kwargs}")
+
 		iterator = tqdm(eval_loader, desc="Eval")
 		for batch in iterator:
 			if processed >= max_samples:
@@ -1093,6 +1127,7 @@ def evaluate(args: argparse.Namespace) -> Tuple[float, float, int]:
 				amp_dtype=eval_amp_dtype,
 				beam_size=args.beam_size,
 				tokenizer=tokenizer,
+				**alpha_kwargs,
 			)
 
 			for i in range(len(pred_batch)):
