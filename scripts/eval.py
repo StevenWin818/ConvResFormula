@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -57,6 +58,86 @@ TEXT_PRESERVE_COMMANDS = {
 	"\\operatorname",
 }
 
+FONT_STYLES = {
+	"\\mathrm",
+	"\\mathbf",
+	"\\mathit",
+	"\\mathcal",
+	"\\mathscr",
+	"\\mathbb",
+	"\\mathfrak",
+	"\\mathsf",
+	"\\boldsymbol",
+	"\\bm",
+	"\\text",
+	"\\operatorname",
+	"\\mbox",
+	"\\textnormal",
+	"\\textbf",
+	"\\textit",
+}
+
+def _strip_font_styles_once(tex: str) -> str:
+	out: List[str] = []
+	i = 0
+	while i < len(tex):
+		matched_cmd = None
+		for cmd in FONT_STYLES:
+			if tex.startswith(cmd, i):
+				next_char_idx = i + len(cmd)
+				if next_char_idx < len(tex) and tex[next_char_idx].isalpha():
+					continue
+				matched_cmd = cmd
+				j = next_char_idx
+				# 应对 \operatorname* 的情况
+				if j < len(tex) and tex[j] == "*":
+					j += 1
+				while j < len(tex) and tex[j].isspace():
+					j += 1
+				if j < len(tex) and tex[j] == "{":
+					open_idx = j
+					close_idx = _find_matching_brace(tex, open_idx)
+					if close_idx != -1:
+						inner = tex[open_idx + 1:close_idx]
+						out.append(inner)
+						i = close_idx + 1
+						matched_cmd = "handled"
+						break
+				else:
+					# 处理 \mathbf x 这种不带花括号的情况
+					if j < len(tex):
+						if tex[j] == "\\":
+							k = j + 1
+							while k < len(tex) and tex[k].isalpha():
+								k += 1
+							if k == j + 1 and k < len(tex):
+								k += 1
+							out.append(tex[j:k])
+							i = k
+						else:
+							out.append(tex[j])
+							i = j + 1
+						matched_cmd = "handled"
+						break
+		
+		if matched_cmd is None:
+			out.append(tex[i])
+			i += 1
+		elif matched_cmd == "handled":
+			continue
+	return "".join(out)
+
+def strip_font_styles(tex: str) -> str:
+	"""剥离 LaTeX 字体外壳，暴露纯净结构，支持嵌套"""
+	if tex is None:
+		return ""
+	original = tex
+	for _ in range(10):  # 支持到 10 层嵌套
+		stripped = _strip_font_styles_once(original)
+		if stripped == original:
+			break
+		original = stripped
+	return original
 
 def _is_escaped(text: str, idx: int) -> bool:
 	"""判断 text[idx] 是否被奇数个反斜杠转义。"""
@@ -169,7 +250,7 @@ def _protect_text_like_groups(tex: str) -> Tuple[str, List[str]]:
 			if cmd_end < len(tex) and tex[cmd_end] == "{":
 				close_idx = _find_matching_brace(tex, cmd_end)
 				if close_idx != -1:
-					placeholder = f"__TEXTLIKE_{len(protected)}__"
+					placeholder = f"##TEXTLIKE{len(protected)}##"
 					protected.append(tex[i:close_idx + 1])
 					out.append(placeholder)
 					i = close_idx + 1
@@ -183,7 +264,7 @@ def _protect_text_like_groups(tex: str) -> Tuple[str, List[str]]:
 
 def _restore_text_like_groups(tex: str, protected: List[str]) -> str:
 	for idx, original in enumerate(protected):
-		tex = tex.replace(f"__TEXTLIKE_{idx}__", original)
+		tex = tex.replace(f"##TEXTLIKE{idx}##", original)
 	return tex
 
 
@@ -246,8 +327,157 @@ def _normalize_over_to_frac(tex: str) -> str:
 
 		return "".join(out)
 
+	# 处理顶层 \over
+	over_parts = _split_top_level_over(tex)
+	if over_parts is not None:
+		num, den = over_parts
+		return f"\\frac{{{_transform_segment(num)}}}{{{_transform_segment(den)}}}"
+	
 	return _transform_segment(tex)
 
+
+def _unwrap_double_braces(tex: str) -> str:
+	"""将形如 {{...}} 的两层或多层无意义嵌套剥离掉。"""
+	out: List[str] = []
+	i = 0
+	while i < len(tex):
+		if tex.startswith("{{", i):
+			close_idx = _find_matching_brace(tex, i)
+			if close_idx != -1 and tex[close_idx - 1] == "}":
+				inner_open = i + 1
+				inner_close = _find_matching_brace(tex, inner_open)
+				if inner_close == close_idx - 1:
+					inner = tex[inner_open:inner_close + 1]
+					out.append(inner)
+					i = close_idx + 1
+					continue
+		out.append(tex[i])
+		i += 1
+	return "".join(out)
+
+# 需要保护大括号不被剥离的命令（它们通常需要参数且大括号起分组作用）
+ARG_COMMANDS = {
+	"\\frac", "\\sqrt", "\\binom", "\\stackrel", "\\overset", "\\underset",
+	"\\acute", "\\bar", "\\breve", "\\check", "\\dot", "\\ddot", "\\grave",
+	"\\hat", "\\tilde", "\\vec", "\\overline", "\\underline",
+	"\\widehat", "\\widetilde", "\\sqrt", "\\boxed",
+}
+
+def _unwrap_redundant_braces(tex: str) -> str:
+	"""
+	递归剥离冗余的花括号。
+	例如: {x} -> x, {{x}} -> x, {R}_{MR} -> R_{MR}, {\frac{1}{2}} -> \frac{1}{2}
+	"""
+	out: List[str] = []
+	i = 0
+	while i < len(tex):
+		if tex[i] == "{" and not _is_escaped(tex, i):
+			j = _find_matching_brace(tex, i)
+			if j != -1:
+				inner = tex[i+1:j]
+				# 递归处理内部
+				inner = _unwrap_redundant_braces(inner)
+				
+				# 获取前后文
+				prev_text = "".join(out).strip()
+				prev = prev_text[-1] if prev_text else ""
+				
+				# 检查是否处于命令参数位置
+				is_cmd_arg = False
+				for cmd in ARG_COMMANDS:
+					if prev_text.endswith(cmd):
+						# 确保是完整的命令，不是其他命令的后缀
+						cmd_idx = prev_text.rfind(cmd)
+						if cmd_idx == 0 or not prev_text[cmd_idx-1].isalpha():
+							is_cmd_arg = True
+							break
+				
+				# 特殊处理 \frac: 如果前一个 token 是 \frac 的第一个参数（即紧跟在 } 后面）
+				if not is_cmd_arg and prev == "}" and "\\frac" in prev_text:
+					is_cmd_arg = True
+
+				nxt_text = tex[j+1:].strip()
+				nxt = nxt_text[0] if nxt_text else ""
+				
+				# 判定是否需要保留
+				is_sub = (prev == "^" or prev == "_" or nxt == "^" or nxt == "_")
+				is_single = (len(inner) == 1 and inner not in "{}^_&\\") or \
+						   (inner.startswith("\\") and inner[1:].isalpha() and "\\" not in inner[1:])
+				
+				# 如果内容已经被括号 () 或 [] 包裹，对于上下标位置通常可以安全剥离大括号
+				is_already_grouped = (inner.startswith("(") and inner.endswith(")")) or \
+									 (inner.startswith("[") and inner.endswith("]"))
+				
+				keep = False
+				if is_cmd_arg and not is_single:
+					keep = True
+				elif is_sub and not is_single and not is_already_grouped:
+					keep = True
+				elif "&" in inner or "\\\\" in inner or "\\begin" in inner or "\\end" in inner:
+					keep = True
+				
+				if keep:
+					out.append("{" + inner + "}")
+				else:
+					out.append(inner)
+				i = j + 1
+				continue
+		out.append(tex[i])
+		i += 1
+	return "".join(out)
+
+def _unwrap_outer_brace(tex: str) -> str:
+	tex = tex.strip()
+	if tex.startswith("{") and tex.endswith("}"):
+		close_idx = _find_matching_brace(tex, 0)
+		if close_idx == len(tex) - 1:
+			return tex[1:-1]
+	return tex
+
+def _remove_commands_and_args(tex: str, cmds: List[str]) -> str:
+	"""彻底移除某个宏及其可选参数[]和必选参数{}（如 \\smash, \\vphantom 等）"""
+	out: List[str] = []
+	i = 0
+	while i < len(tex):
+		matched_cmd = None
+		for cmd in cmds:
+			if tex.startswith(cmd, i):
+				next_char_idx = i + len(cmd)
+				if next_char_idx < len(tex) and tex[next_char_idx].isalpha():
+					continue
+				matched_cmd = cmd
+				break
+		
+		if matched_cmd is not None:
+			j = i + len(matched_cmd)
+			while j < len(tex) and tex[j].isspace():
+				j += 1
+			# 略过可选的 [...]
+			if j < len(tex) and tex[j] == "[":
+				while j < len(tex) and tex[j] != "]":
+					j += 1
+				if j < len(tex) and tex[j] == "]":
+					j += 1
+			while j < len(tex) and tex[j].isspace():
+				j += 1
+			# 如果跟着花括号则一并截断移除
+			if j < len(tex) and tex[j] == "{":
+				close_idx = _find_matching_brace(tex, j)
+				if close_idx != -1:
+					i = close_idx + 1
+					continue
+		
+		out.append(tex[i])
+		i += 1
+	return "".join(out)
+
+def _unwrap_redundant_matrix(tex: str) -> str:
+	def repl(m):
+		content = m.group(1)
+		if "\\\\" not in content and "&" not in content:
+			return content
+		return m.group(0)
+	return re.sub(r"\\begin\{[pvBbmV]?matrix\}(.*?)\\end\{[pvBbmV]?matrix\}", repl, tex)
 
 def robust_normalize_tex(tex: str) -> str:
 	"""增强版归一化：应对排版宏和冗余括号造成的视觉假阳性。"""
@@ -255,40 +485,63 @@ def robust_normalize_tex(tex: str) -> str:
 		return ""
 
 	tex = str(tex).strip()
+	tex = _unwrap_redundant_matrix(tex)
 	tex, protected_text_groups = _protect_text_like_groups(tex)
 	
-	# 1. 优先剔除所有空白字符，方便后续无缝模式匹配
-	tex = re.sub(r"\s+", "", tex)
-
-	# 2. 仅剔除纯风格宏；保留 \limits/\nolimits 以避免抹平上下标布局差异
-	for macro in [r"\textstyle", r"\displaystyle", r"\scriptstyle", r"\scriptscriptstyle"]:
-		tex = tex.replace(macro, "")
-
-	# 3. 保留 \left 和 \right，避免大括号尺寸差异被错误归一
-
-	# 4. 剥离无意义的安全括号包裹 (处理类似 \gcd({S_{i}}) -> \gcd(S_{i}) 的问题)
-	# 循环执行 3 次以应对可能的嵌套包裹
-	for _ in range(3):
-		# 仅剥离“完整包裹”的冗余花括号，支持嵌套内容且不破坏合法结构。
-		tex = _unwrap_delimiter_wrapped_group(tex, "(", ")")
-		tex = _unwrap_delimiter_wrapped_group(tex, "[", "]")
-		tex = _unwrap_delimiter_wrapped_group(tex, "|", "|")
-		tex = tex.replace("\\{{", "\\{").replace("}\\}", "\\}")
-		tex = tex.replace("_{}", "")  # 消除模型误生成的空下标
-		tex = tex.replace("^{}", "")  # 消除模型误生成的空上标
-
-	# 5. 剔除不可见的间距控制宏
-	tex = re.sub(r"\\[,;!]", "", tex)
-	tex = re.sub(r"\\[qQ]uad", "", tex)
-	tex = re.sub(r"\\ ", "", tex)
-
-	# 6. 统一常见视觉等价宏
+	# 统一常用宏的简写和变体
 	tex = re.sub(r"\\le(?![A-Za-z])", r"\\leq", tex)
 	tex = re.sub(r"\\ge(?![A-Za-z])", r"\\geq", tex)
 	tex = re.sub(r"\\ne(?![A-Za-z])", r"\\neq", tex)
-	tex = re.sub(r"\\rm(?![A-Za-z])", r"\\mathrm", tex)
+	tex = re.sub(r"\\phi(?![A-Za-z])", r"\\varphi", tex) 
+	tex = re.sub(r"\\epsilon(?![A-Za-z])", r"\\varepsilon", tex)
+	# 统一分隔符
+	tex = re.sub(r"\\mid(?![A-Za-z])", r"|", tex)
+	tex = re.sub(r"\\vert(?![A-Za-z])", r"|", tex)
+
+	# 0. 提前剔除间距宏，避免 \s+ 移除后粘连，包括 \ (backslash space), \, \; \: \! \quad \qquad \enspace
+	tex = re.sub(r"\\[,;>!/:\s]", "", tex)
+	tex = re.sub(r"\\[qQ]uad", "", tex)
+	tex = re.sub(r"\\enspace", "", tex)
+	tex = tex.replace("\\ ", "")
+	tex = tex.replace("~", "")  # LaTeX 不可断行空白
+	tex = re.sub(r"\\rm(?![A-Za-z])", "", tex) # 直接抹除过时的 \rm 字体开关
+	
+	# 0.5 提前剔除纯风格与大小调整宏，以及看不见的空占位盒子
+	size_macros = [
+		r"\\textstyle", r"\\displaystyle", r"\\scriptstyle", r"\\scriptscriptstyle",
+		r"\\Bigg", r"\\bigg", r"\\Big", r"\\big",
+		r"\\Biggl", r"\\biggl", r"\\Bigl", r"\\bigl",
+		r"\\Biggr", r"\\biggr", r"\\Bigr", r"\\bigr",
+		r"\\limits", r"\\nolimits"
+	]
+	for macro in size_macros:
+		tex = re.sub(macro + r"(?![A-Za-z])", "", tex)
+
+	tex = _remove_commands_and_args(tex, ["\\phantom", "\\vphantom", "\\hphantom", "\\smash"])
+
+	# 1. 统一 \over 为 \frac
 	tex = _normalize_over_to_frac(tex)
 	tex = _unwrap_wrapped_frac(tex)
+
+	# 2. 剥离冗余花括号
+	tex = _unwrap_redundant_braces(tex)
+
+	# 3. 优先剔除所有空白字符
+	tex = re.sub(r"\s+", "", tex)
+	
+	# 4. 再次剥离冗余花括号
+	tex = _unwrap_redundant_braces(tex)
+	tex = tex.replace("{}", "").replace("_{}", "").replace("^{}", "")
+
+	# 5. 矩阵内容归一化：移除 & 和 \\ 前后的空格
+	def _norm_matrix(m):
+		m_type = m.group(1)
+		content = m.group(2)
+		content = re.sub(r"\s*&\s*", "&", content)
+		content = re.sub(r"\s*\\\\\s*", r"\\\\", content)
+		return f"\\begin{{{m_type}}}{content}\\end{{{m_type}}}"
+	tex = re.sub(r"\\begin\{([pvBbmV]?matrix)\}(.*?)\\end\{\1\}", _norm_matrix, tex, flags=re.DOTALL)
+
 	tex = _restore_text_like_groups(tex, protected_text_groups)
 
 	return tex
@@ -400,7 +653,22 @@ def canonicalize_svg(svg_text: str) -> Optional[str]:
 			val = re.sub(r"-?\d+\.\d{3,}", lambda m: f"{float(m.group(0)):.3f}", val)
 			
 			attrs.append((key, val))
-
+			
+		# 【平坦化优化】消除没有任何视觉属性的干净 <g> 容器带来的结构差异干扰
+			should_flatten = False
+			if tag == "g" and not (elem.text and elem.text.strip()):
+				if not attrs:
+					should_flatten = True
+				elif len(attrs) == 1 and attrs[0][0] == "transform" and "scale" not in attrs[0][1]:
+					should_flatten = True
+					
+			if should_flatten:
+				pieces = []
+				for child in list(elem):
+					pieces.append(_serialize_elem(child))
+					if child.tail and child.tail.strip():
+						pieces.append(re.sub(r"\s+", " ", child.tail).strip())
+				return "".join(pieces)
 		attrs.sort(key=lambda x: x[0])
 		attr_text = "".join(f' {k}="{v}"' for k, v in attrs)
 		pieces = [f"<{tag}{attr_text}>"]
@@ -590,6 +858,10 @@ def check_visual_equivalence(gt_tex: str, pred_tex: str, svg_renderer: NodeKatex
 	norm_gt = robust_normalize_tex(gt_tex)
 	norm_pred = robust_normalize_tex(pred_tex)
 
+	# 快速路径：归一化后的文本一致，直接判定正确
+	if norm_gt == norm_pred:
+		return True
+
 	svg_gt = svg_renderer.render(norm_gt)
 	svg_pred = svg_renderer.render(norm_pred)
 	if svg_gt is None or svg_pred is None:
@@ -606,13 +878,14 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--model_config", type=str, default=str(PROJECT_ROOT / "configs" / "model_convnext_attnres.yaml"))
 	parser.add_argument("--d_model", type=int, default=256)
 	parser.add_argument("--max_area", type=int, default=98304)
-	parser.add_argument("--batch_size", type=int, default=24)
+	parser.add_argument("--batch_size", type=int, default=20)
 	parser.add_argument("--beam_size", type=int, default=1, help="Beam Search 大小，默认 1 为贪心解码")
 	parser.add_argument("--num_workers", type=int, default=4)
 	parser.add_argument("--max_len", type=int, default=160)
 	parser.add_argument("--max_samples", type=int, default=0, help="评估样本数上限，<=0 表示全量")
 	parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
 	parser.add_argument("--amp_dtype", type=str, choices=["fp16", "bf16", "fp32"], default="bf16", help="评估精度类型")
+	parser.add_argument("--ignore_style", action="store_true", default=True, help="忽略字体等视觉样式修饰，用于手写体等结构的宽松匹配")
 	parser.add_argument("--compile", dest="enable_compile", action="store_true", help="启用 torch.compile")
 	parser.add_argument("--no_compile", dest="enable_compile", action="store_false", help="禁用 torch.compile")
 	parser.set_defaults(enable_compile=False)
@@ -721,36 +994,36 @@ def collate_eval_batch(batch, pad_token_id: int) -> Dict[str, torch.Tensor]:
 
 
 def get_syntax_imbalance_penalty(text: str) -> int:
-    """计算文本中 LaTeX 致命结构失衡的数量"""
-    # 1. 过滤掉被转义的括号，它们不参与结构
-    text = text.replace(r'\{', '').replace(r'\}', '')
-    
-    imbalance = 0
-    
-    # 2. 大括号栈匹配
-    depth = 0
-    for char in text:
-        if char == '{':
-            depth += 1
-        elif char == '}':
-            if depth > 0:
-                depth -= 1
-            else:
-                imbalance += 1
-    imbalance += depth
-    
-    # 3. 精确匹配 \left 和 \right，避免误伤 \rightarrow
-    # (?![a-zA-Z]) 确保后面没有其他字母，即匹配精确的命令边界
-    left_count = len(re.findall(r'\\left(?![a-zA-Z])', text))
-    right_count = len(re.findall(r'\\right(?![a-zA-Z])', text))
-    imbalance += abs(left_count - right_count)
-    
-    # 4. 精确匹配 \begin 和 \end 
-    begin_count = len(re.findall(r'\\begin(?![a-zA-Z])', text))
-    end_count = len(re.findall(r'\\end(?![a-zA-Z])', text))
-    imbalance += abs(begin_count - end_count)
-    
-    return imbalance
+	"""计算文本中 LaTeX 致命结构失衡的数量"""
+	# 1. 过滤掉被转义的括号，它们不参与结构
+	text = text.replace(r'\{', '').replace(r'\}', '')
+	
+	imbalance = 0
+	
+	# 2. 大括号栈匹配
+	depth = 0
+	for char in text:
+		if char == '{':
+			depth += 1
+		elif char == '}':
+			if depth > 0:
+				depth -= 1
+			else:
+				imbalance += 1
+	imbalance += depth
+	
+	# 3. 精确匹配 \left 和 \right，避免误伤 \rightarrow
+	# (?![a-zA-Z]) 确保后面没有其他字母，即匹配精确的命令边界
+	left_count = len(re.findall(r'\\left(?![a-zA-Z])', text))
+	right_count = len(re.findall(r'\\right(?![a-zA-Z])', text))
+	imbalance += abs(left_count - right_count)
+	
+	# 4. 精确匹配 \begin 和 \end 
+	begin_count = len(re.findall(r'\\begin(?![a-zA-Z])', text))
+	end_count = len(re.findall(r'\\end(?![a-zA-Z])', text))
+	imbalance += abs(begin_count - end_count)
+	
+	return imbalance
 
 
 @torch.no_grad()
@@ -1159,7 +1432,13 @@ def evaluate(args: argparse.Namespace) -> Tuple[float, float, int]:
 					total_token_correct += sample_correct
 					total_token_count += sample_total
 
-				is_correct = check_visual_equivalence(target_text, pred_text, svg_renderer)
+				if args.ignore_style:
+					styled_target_text = strip_font_styles(target_text)
+					styled_pred_text = strip_font_styles(pred_text)
+					is_correct = check_visual_equivalence(styled_target_text, styled_pred_text, svg_renderer)
+				else:
+					is_correct = check_visual_equivalence(target_text, pred_text, svg_renderer)
+				
 				text_exact_match += int(pred_text == target_text)
 
 				dist = levenshtein_distance(pred_text, target_text)
@@ -1198,11 +1477,12 @@ def evaluate(args: argparse.Namespace) -> Tuple[float, float, int]:
 		top_error_path = os.path.join(args.report_dir, f"ar_eval_top_errors_{ts}.txt")
 
 		with open(report_path, "w", encoding="utf-8") as f:
+			visual_rule_str = "normalize -> strip_font -> svg_dom(strict)" if getattr(args, "ignore_style", False) else "normalize -> svg_dom(strict)"
 			top_errors = mismatch_counter.most_common(20)
 			f.write("=== AR Eval Report (Visual Equivalence) ===\n")
 			f.write(f"checkpoint: {args.checkpoint}\n")
 			f.write(f"eval_h5: {args.eval_h5}\n")
-			f.write("visual_rule: normalize -> svg_dom(strict)\n")
+			f.write(f"visual_rule: {visual_rule_str}\n")
 			f.write(f"svg_node_script: {svg_node_script}\n")
 			f.write(f"EvalProcessed: {processed}\n")
 			f.write(f"EvalRenderExact: {exact_match}\n")
@@ -1235,7 +1515,7 @@ def evaluate(args: argparse.Namespace) -> Tuple[float, float, int]:
 		print(f"EvalTextEM(%)   : {text_em_rate * 100:.4f}")
 		print(f"EvalTokenAcc(%) : {token_acc_rate * 100:.4f}")
 		print(f"EvalTFTokenAcc(%): {tf_token_acc_rate * 100:.4f}")
-		print("VisualRule      : normalize -> svg_dom(strict)")
+		print(f"VisualRule      : {visual_rule_str}")
 		print(f"SVGNodeScript   : {svg_node_script}")
 		print(f"EvalNED       : {avg_ned:.6f}") 
 		print(f"AvgED         : {avg_ed:.4f}")
